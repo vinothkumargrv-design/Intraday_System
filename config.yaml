@@ -1,0 +1,690 @@
+# =============================================================================
+# RAPID FIRE INTRADAY TRADING SYSTEM - CONFIGURATION
+# =============================================================================
+# This file contains all configurable parameters for the trading system.
+# All values can be overridden via environment variables (uppercase prefix).
+
+# =============================================================================
+# SYSTEM CONFIGURATION
+# =============================================================================
+system:
+  name: "RapidFire_Intraday"
+  version: "1.0.0"
+  environment: "development"  # development, paper, live
+  timezone: "Asia/Kolkata"
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  
+  # Data storage
+  data_dir: "data"
+  candle_db_path: "data/candles.sqlite"
+  trade_journal_path: "data/trade_journal.csv"
+  log_file_path: "logs/trading_system.log"
+  
+  # System performance
+  max_cpu_cores: 4
+  event_loop_threads: 2
+  
+
+# =============================================================================
+# BROKER CONFIGURATION
+# =============================================================================
+broker:
+  # Select active broker: ZERODHA, ALPACA, INTERACTIVE_BROKERS, PAPER
+  active: "PAPER"
+  
+  # Common settings for all brokers
+  reconnect_attempts: 3
+  reconnect_delay_seconds: 5
+  api_timeout_seconds: 10
+  max_api_retries: 3
+  retry_backoff_multiplier: 2.0
+  
+  # Zerodha Kite Connect
+  zerodha:
+    api_key: ""
+    api_secret: ""
+    access_token: ""
+    user_id: ""
+    password: ""
+    pin: ""
+    base_url: "https://api.kite.trade"
+    websocket_url: "wss://api.kite.trade/stream"
+    
+    # Product types: MIS (Intraday), NRML (Delivery), CNS ( margin)
+    default_product: "MIS"
+    
+    # Order types supported
+    order_types:
+      - MARKET
+      - LIMIT
+      - SL
+      - SL-M
+    
+    # Variety types
+    variety: "regular"
+    
+  # Alpaca
+  alpaca:
+    api_key: ""
+    api_secret: ""
+    paper_trading: true
+    base_url: "https://paper-api.alpaca.markets"
+    websocket_url: "wss://paper-api.alpaca.markets/stream"
+    data_websocket_url: "wss://stream.data.alpaca.co"
+    
+  # Interactive Brokers
+  interactive_brokers:
+    account_id: ""
+    client_id: 1
+    host: "127.0.0.1"
+    port: 7497  # Paper trading port
+    paper_trading: true
+    
+  # Paper Trading
+  paper:
+    initial_balance: 100000.0
+    simulate_slippage: true
+    slippage_factor: 0.0005  # 0.05%
+    simulate_commissions: true
+    commission_rate: 0.0003  # 0.03%
+
+
+# =============================================================================
+# MARKET DATA CONFIGURATION
+# =============================================================================
+market_data:
+  # WebSocket settings
+  websocket:
+    enabled: true
+    auto_reconnect: true
+    max_reconnect_attempts: 5
+    reconnect_delay_seconds: 3
+    ping_interval_seconds: 30
+    pong_timeout_seconds: 15
+    
+    # Symbols to subscribe to (ISINs for Zerodha, symbols for others)
+    symbols:
+      - "RELIANCE"
+      - "TCS"
+      - "INFY"
+      - "HDFCBANK"
+      - "ICICIBANK"
+      - "BHARTIARTL"
+      - "ASIANPAINT"
+      - "TATAMOTORS"
+      - "LT"
+      - "SBIN"
+      - "KOTAKBANK"
+      - "HINDUNILVR"
+      - "ITC"
+      - "NTPC"
+      - "ONGC"
+      - "COALINDIA"
+    
+    # Tick data settings
+    tick_buffer_size: 10000
+    tick_aggregation_interval_ms: 100  # Aggregate ticks to 100ms bars
+    
+  # REST data settings
+  rest:
+    historical_data_days: 30
+    max_bars_per_request: 500
+    rate_limit_delay_ms: 200
+    
+  # Resampling settings
+  resampling:
+    enabled: true
+    timeframes:
+      - "1m"
+      - "5m"
+    
+  # Data validation
+  validation:
+    check_gaps: true
+    fill_missing_bars: true
+    max_allowed_gap_minutes: 5
+    out_of_order_tolerance_ms: 100
+
+
+# =============================================================================
+# STRATEGY CONFIGURATION
+# =============================================================================
+strategies:
+  # Global strategy settings
+  enabled: true
+  max_strategies_per_symbol: 6
+  
+  # Strategy weights (must sum to 1.0 or use normalization)
+  weights:
+    ORB: 0.15
+    VWAP_MR: 0.20
+    MOMENTUM_BURST: 0.20
+    EMA_CROSSOVER: 0.15
+    ORDER_FLOW: 0.15
+    SUPERTREND: 0.15
+  
+  # Strategy-specific parameters
+  parameters:
+    ORB:  # Opening Range Breakout
+      enabled: true
+      timeframe: "5m"
+      orb_minutes: 15  # Opening range period in minutes
+      orb_multiplier: 1.0  # Multiplier for range breakout
+      atr_period: 14
+      atr_multiplier: 0.5  # ATR multiplier for SL
+      min_volume_filter: 1000
+      
+    VWAP_MR:  # VWAP Mean Reversion
+      enabled: true
+      timeframe: "1m"
+      vwap_period: 50  # Period for VWAP calculation
+      std_deviation_multiplier: 2.0  # 2 standard deviations
+      rsi_period: 14
+      rsi_overbought: 70
+      rsi_oversold: 30
+      min_deviation_pct: 0.5  # Minimum deviation percentage to trigger
+      
+    MOMENTUM_BURST:  # Momentum Burst
+      enabled: true
+      timeframe: "1m"
+      lookback_period: 3  # 3 consecutive candles
+      volume_multiplier: 2.0  # 2x average volume
+      avg_volume_period: 20
+      price_change_pct: 0.5  # 0.5% price change minimum
+      confirm_with_volume: true
+      
+    EMA_CROSSOVER:  # EMA Crossover Scalper
+      enabled: true
+      timeframe: "1m"
+      fast_ema_period: 9
+      slow_ema_period: 21
+      rsi_period: 14
+      rsi_filter_enabled: true
+      rsi_min: 40  # Only trade if RSI > 40 for BUY, < 60 for SELL
+      rsi_max: 60
+      atr_period: 14
+      sl_atr_multiplier: 1.5
+      tp_atr_multiplier: 2.0
+      
+    ORDER_FLOW:  # Order Flow Imbalance
+      enabled: true
+      timeframe: "TICK"
+      tick_window_seconds: 5  # Aggregation window
+      imbalance_threshold: 0.6  # 60% imbalance required
+      min_tick_count: 10  # Minimum ticks in window
+      volume_filter_pct: 0.1  # Filter out small volume ticks
+      aggression_weight: 0.7  # Weight of aggressive orders
+      
+    SUPERTREND:  # Supertrend + ATR Trailing
+      enabled: true
+      timeframe: "1m"
+      atr_period: 10
+      multiplier: 3.0
+      trending_regime_only: true  # Only trade in trending markets
+      use_trailing_stop: true
+      trailing_atr_multiplier: 1.5
+
+
+# =============================================================================
+# SIGNAL AGGREGATION CONFIGURATION
+# =============================================================================
+signal_aggregation:
+  # Aggregation rules
+  threshold: 0.65  # Minimum net score to trigger a trade
+  min_agreeing_strategies: 2  # At least 2 strategies must agree
+  use_regime_filter: true
+  
+  # Regime filter settings
+  regime:
+    volatility_threshold: 0.75  # ATR percentile threshold
+    trend_strength_threshold: 0.6
+    use_vix_filter: false
+    vix_max: 25.0  # Don't trade if VIX > 25
+    
+  # Confidence scoring
+  confidence:
+    strategy_weight_multiplier: 1.0
+    agreement_bonus: 0.1  # Bonus for each additional agreeing strategy
+    regime_bonus: 0.1  # Bonus if regime filter passes
+    time_decay_factor: 0.95  # Confidence decays over time
+    
+  # Cooldown settings
+  cooldown:
+    enabled: true
+    seconds_per_symbol: 60
+    
+  # Signal priority
+  priority:
+    enabled: false
+    high_confidence_threshold: 0.8
+    low_confidence_threshold: 0.5
+
+
+# =============================================================================
+# RISK MANAGEMENT CONFIGURATION
+# =============================================================================
+risk_management:
+  # Per-trade risk
+  per_trade:
+    max_risk_pct: 0.5  # 0.5% of equity per trade
+    min_risk_pct: 0.1  # 0.1% minimum
+    
+  # Position sizing
+  position_sizing:
+    method: "RiskBased"  # RiskBased, FixedQuantity, PercentOfEquity
+    fixed_quantity: 100
+    percent_of_equity: 1.0
+    
+  # Position limits
+  limits:
+    max_concurrent_positions: 5
+    max_positions_per_symbol: 1
+    max_positions_per_strategy: 10
+    max_exposure_pct: 10.0  # 10% of equity max exposure
+    
+  # Daily limits
+  daily:
+    max_loss_pct: 2.0  # 2% daily loss limit
+    max_profit_pct: 4.0  # 4% daily profit target
+    reset_time: "00:00"  # Reset at midnight
+    
+  # Stop loss settings
+  stop_loss:
+    hard_stop_enabled: true
+    hard_stop_pct: 1.0  # 1% from entry
+    trailing_stop_enabled: true
+    trailing_stop_atr_multiplier: 1.5
+    use_tick_based_trailing: false
+    tick_based_trailing_points: 5
+    
+  # Time-based exits
+  time_stop:
+    enabled: true
+    square_off_time: "15:15"  # 15:15 IST
+    pre_square_off_minutes: 5  # Start closing positions 5 minutes before
+    
+  # Spread and slippage protection
+  protection:
+    max_spread_pct: 0.15  # 0.15% max spread
+    slippage_buffer_pct: 0.05  # 0.05% slippage buffer
+    min_volume_for_entry: 1000  # Minimum volume to enter
+    
+  # Circuit breakers
+  circuit_breakers:
+    daily_loss_kill_switch: true
+    consecutive_failures_limit: 3
+    websocket_disconnect_timeout_seconds: 10
+    manual_kill_file: "/tmp/KILL"
+    
+  # Leverage settings
+  leverage:
+    max_leverage: 5.0
+    use_margin: false
+
+
+# =============================================================================
+# EXECUTION CONFIGURATION
+# =============================================================================
+execution:
+  # Order types
+  entry:
+    order_type: "LIMIT"  # MARKET or LIMIT
+    use_fallback_to_market: true
+    fallback_timeout_seconds: 2
+    
+  # Stop loss and take profit
+  exits:
+    use_bracket_orders: true  # Use bracket orders if broker supports
+    use_oco_orders: false
+    
+    # SL settings
+    stop_loss:
+      order_type: "SL-M"  # SL-M for Zerodha, SL for others
+      trigger_on_tick: true
+      
+    # TP settings
+    take_profit:
+      order_type: "LIMIT"
+      risk_reward_ratio: 2.0  # 2:1 risk-reward
+      
+  # Partial fill handling
+  partial_fills:
+    adjust_sl_quantity: true
+    split_orders: false
+    max_partial_fills: 3
+    
+  # Order placement
+  placement:
+    idempotency_keys_enabled: true
+    prevent_duplicate_orders: true
+    duplicate_order_timeout_seconds: 30
+    
+  # Retry logic
+  retries:
+    enabled: true
+    max_retries: 3
+    exponential_backoff: true
+    base_delay_ms: 100
+    max_delay_ms: 5000
+    retryable_errors:
+      - "TIMEOUT"
+      - "NETWORK_ERROR"
+      - "RATE_LIMIT"
+      - "TEMPORARY_ERROR"
+
+
+# =============================================================================
+# PORTFOLIO TRACKING CONFIGURATION
+# =============================================================================
+portfolio:
+  # Initial settings
+  initial_equity: 100000.0
+  initial_cash: 100000.0
+  currency: "INR"
+  
+  # Tracking settings
+  tracking:
+    update_frequency_seconds: 1
+    calculate_pnl_on_tick: false
+    calculate_pnl_on_bar: true
+    
+  # PnL calculation
+  pnl:
+    include_commissions: true
+    include_fees: true
+    include_slippage: true
+    
+  # Commission and fee structure (Zerodha example)
+  fees:
+    brokerage: 0.0003  # 0.03%
+    exchange_fee: 0.0005  # 0.05%
+    stt: 0.001  # 0.1% for equity delivery
+    stt_intraday: 0.00025  # 0.025% for intraday
+    gst: 0.18  # 18% on brokerage + exchange fees
+    stamp_duty: 0.0001  # 0.01% for buy
+    
+    # Alpaca fees
+    alpaca:
+      commission: 0.0  # $0 commission
+      exchange_fee: 0.005  # $0.005 per share
+      
+    # Interactive Brokers fees
+    interactive_brokers:
+      commission: 0.0005  # $0.0005 per share
+      min_commission: 1.0  # $1 minimum
+      max_commission_pct: 0.005  # 0.5% max
+
+
+# =============================================================================
+# NOTIFICATION CONFIGURATION
+# =============================================================================
+notifications:
+  enabled: true
+  
+  # Telegram
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
+    parse_mode: "HTML"
+    
+    # Notification types to send
+    notify_on:
+      - "TRADE_ENTRY"
+      - "TRADE_EXIT"
+      - "STOP_LOSS_HIT"
+      - "TAKE_PROFIT_HIT"
+      - "KILL_SWITCH_ACTIVATED"
+      - "DAILY_LIMIT_HIT"
+      - "SYSTEM_START"
+      - "SYSTEM_STOP"
+      - "ERROR"
+    
+    # Rate limiting
+    rate_limit:
+      max_messages_per_minute: 10
+      
+  # Email
+  email:
+    enabled: false
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    username: ""
+    password: ""
+    from_email: ""
+    to_emails: []
+    
+    # Notification types to send
+    notify_on:
+      - "DAILY_REPORT"
+      - "KILL_SWITCH_ACTIVATED"
+      - "ERROR"
+    
+    # Daily report settings
+    daily_report:
+      enabled: true
+      send_time: "18:00"  # 6:00 PM IST
+      include_pnl: true
+      include_positions: true
+      include_metrics: true
+
+
+# =============================================================================
+# BACKTESTER CONFIGURATION
+# =============================================================================
+backtester:
+  # Backtest settings
+  enabled: true
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  initial_capital: 100000.0
+  
+  # Data
+  data:
+    source: "local"  # local, yahoo, alpha_vantage
+    data_dir: "data/backtest"
+    
+  # Slippage and costs
+  costs:
+    simulate_slippage: true
+    slippage_factor: 0.0005  # 0.05%
+    
+    simulate_commissions: true
+    brokerage_rate: 0.0003
+    exchange_fee_rate: 0.0005
+    stt_rate: 0.00025
+    gst_rate: 0.18
+    stamp_duty_rate: 0.0001
+    
+  # Execution
+  execution:
+    use_limit_orders: false  # Use market orders for backtest
+    partial_fills: false
+    
+  # Performance metrics
+  metrics:
+    calculate: true
+    output_dir: "backtest_results"
+    generate_plots: true
+    generate_reports: true
+    
+  # Walk-forward optimization
+  optimization:
+    enabled: false
+    in_sample_period_days: 30
+    out_of_sample_period_days: 15
+    max_iterations: 100
+    optimizer: "genetic"  # genetic, grid, random
+
+
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+logging:
+  # File logging
+  file:
+    enabled: true
+    path: "logs/trading_system.log"
+    max_size_mb: 10
+    max_backups: 5
+    
+  # Console logging
+  console:
+    enabled: true
+    level: "INFO"
+    
+  # Structured logging
+  structured:
+    enabled: true
+    format: "json"  # json or text
+    include_timestamps: true
+    include_level: true
+    include_module: true
+    include_function: true
+    
+  # Log levels for different components
+  component_levels:
+    data_feed: "INFO"
+    strategy_engine: "INFO"
+    signal_aggregator: "INFO"
+    risk_manager: "INFO"
+    order_manager: "INFO"
+    execution_engine: "INFO"
+    portfolio_tracker: "INFO"
+    broker: "INFO"
+
+
+# =============================================================================
+# DASHBOARD CONFIGURATION
+# =============================================================================
+dashboard:
+  enabled: false
+  host: "0.0.0.0"
+  port: 8501
+  theme: "dark"
+  
+  # Update intervals
+  refresh:
+    positions: 1  # seconds
+    pnl: 1
+    signals: 1
+    metrics: 5
+    
+  # Pages
+  pages:
+    overview: true
+    positions: true
+    signals: true
+    performance: true
+    strategy_analysis: true
+    risk_monitoring: true
+    logs: true
+
+
+# =============================================================================
+# PERFORMANCE MONITORING
+# =============================================================================
+monitoring:
+  enabled: true
+  
+  # Metrics
+  metrics:
+    enabled: true
+    prometheus_enabled: false
+    prometheus_port: 9090
+    
+  # Health checks
+  health_checks:
+    websocket_latency_threshold_ms: 500
+    order_execution_latency_threshold_ms: 500
+    signal_processing_latency_threshold_ms: 100
+    
+  # Alerts
+  alerts:
+    high_latency_threshold_ms: 1000
+    high_cpu_threshold_pct: 90
+    high_memory_threshold_pct: 85
+
+
+# =============================================================================
+# SECURITY CONFIGURATION
+# =============================================================================
+security:
+  # API key management
+  api_keys:
+    encrypt: false
+    key_file: "secrets/keys.enc"
+    
+  # Rate limiting
+  rate_limiting:
+    enabled: true
+    max_requests_per_minute: 100
+    max_requests_per_second: 10
+    
+  # IP filtering (for dashboard)
+  ip_filtering:
+    enabled: false
+    allowed_ips: []
+
+
+# =============================================================================
+# TESTING CONFIGURATION
+# =============================================================================
+testing:
+  enabled: true
+  
+  # Unit tests
+  unit_tests:
+    run_on_startup: false
+    test_data_dir: "tests/data"
+    
+  # Integration tests
+  integration_tests:
+    run_on_startup: false
+    mock_broker: true
+    
+  # Coverage
+  coverage:
+    enabled: false
+    threshold: 80
+
+
+# =============================================================================
+# DOCKER CONFIGURATION
+# =============================================================================
+docker:
+  image: "rapidfire-intraday:latest"
+  container_name: "rapidfire-intraday"
+  
+  # Port mapping
+  ports:
+    - "8501:8501"  # Dashboard
+    - "9090:9090"  # Prometheus
+    
+  # Volumes
+  volumes:
+    - "./config.yaml:/app/config.yaml:ro"
+    - "./data:/app/data"
+    - "./logs:/app/logs"
+    
+  # Environment variables
+  environment:
+    - "TZ=Asia/Kolkata"
+    - "PYTHONUNBUFFERED=1"
+    
+  # Resource limits
+  resources:
+    memory_limit: "2g"
+    cpu_limit: "2.0"
+
+
+# =============================================================================
+# ENVIRONMENT OVERIDES
+# =============================================================================
+# To override any setting, use environment variables with the following format:
+# RAPIDFIRE_{SECTION}_{KEY} (uppercase)
+# Example: RAPIDFIRE_RISK_MANAGEMENT_MAX_DAILY_LOSS_PCT=2.5
+# This will override risk_management.daily.max_loss_pct to 2.5
+
+# For sensitive values (API keys), use environment variables directly:
+# ZERODHA_API_KEY, ZERODHA_API_SECRET, ZERODHA_ACCESS_TOKEN, etc.
