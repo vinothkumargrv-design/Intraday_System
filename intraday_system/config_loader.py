@@ -177,32 +177,35 @@ def get_env_value(key: str, default: Any = None) -> Optional[str]:
 def apply_env_overrides(config: Dict[str, Any], prefix: str = "RAPIDFIRE") -> Dict[str, Any]:
     """Apply environment variable overrides to configuration.
     
-    Environment variables should be in the format:
-    {PREFIX}_{SECTION}_{KEY} or {PREFIX}_{KEY}
+    Variables are ``{PREFIX}_{PATH}`` where path segments are separated by a
+    double underscore, so keys may contain single underscores:
     
-    Example: RAPIDFIRE_RISK_MANAGEMENT_MAX_DAILY_LOSS_PCT=2.5
+        RAPIDFIRE_RISK_MANAGEMENT__DAILY__MAX_LOSS_PCT=1.5
+        -> config['risk_management']['daily']['max_loss_pct'] = 1.5
+    
+    Values are converted to the type of the existing setting when there is one.
     """
     result = config.copy()
     
     for key, value in os.environ.items():
-        if not key.startswith(prefix):
+        if not key.startswith(prefix + "_"):
             continue
         
-        # Remove prefix and split by underscore
-        key_path = key[len(prefix) + 1:].lower().split('_')
+        key_path = [part.lower() for part in key[len(prefix) + 1:].split('__') if part]
+        if not key_path:
+            continue
         
         # Navigate through the config structure
         current = result
-        for i, part in enumerate(key_path[:-1]):
-            if part not in current:
+        for part in key_path[:-1]:
+            if not isinstance(current.get(part), dict):
                 current[part] = {}
             current = current[part]
         
-        # Set the final value
         final_key = key_path[-1]
         env_value = value
         
-        # Try to convert the value based on the existing value type
+        # Convert based on the existing value type
         if final_key in current:
             existing_value = current[final_key]
             if isinstance(existing_value, bool):
@@ -216,19 +219,17 @@ def apply_env_overrides(config: Dict[str, Any], prefix: str = "RAPIDFIRE") -> Di
             else:
                 current[final_key] = env_value
         else:
-            # Try to guess the type from the value
+            # Guess the type from the value
             if env_value.lower() in ('true', 'false'):
                 current[final_key] = parse_bool(env_value)
-            elif '.' in env_value:
-                try:
-                    current[final_key] = parse_float(env_value)
-                except ValueError:
-                    current[final_key] = env_value
             else:
                 try:
-                    current[final_key] = parse_int(env_value)
+                    current[final_key] = int(env_value)
                 except ValueError:
-                    current[final_key] = env_value
+                    try:
+                        current[final_key] = float(env_value)
+                    except ValueError:
+                        current[final_key] = env_value
     
     return result
 
@@ -245,6 +246,14 @@ class ConfigLoader:
         self.config_path = config_path or "config.yaml"
         self._config: Optional[Dict[str, Any]] = None
         self._loaded = False
+    
+    @classmethod
+    def from_dict(cls, config: Dict[str, Any]) -> "ConfigLoader":
+        """Create a loader around an already-loaded configuration dictionary."""
+        loader = cls()
+        loader._config = loader._validate(config)
+        loader._loaded = True
+        return loader
     
     def load(self) -> Dict[str, Any]:
         """Load configuration from file and apply environment overrides."""
@@ -276,7 +285,7 @@ class ConfigLoader:
         search_paths = [
             config_path,
             Path("config.yaml"),
-            Path("intraday_system/config.yaml"),
+            Path(__file__).resolve().parent.parent / "config.yaml",
             Path.home() / ".rapidfire" / "config.yaml",
             Path("/etc/rapidfire/config.yaml")
         ]
@@ -305,6 +314,7 @@ class ConfigLoader:
             zerodha['api_key'] = get_env_value('ZERODHA_API_KEY', zerodha.get('api_key'))
             zerodha['api_secret'] = get_env_value('ZERODHA_API_SECRET', zerodha.get('api_secret'))
             zerodha['access_token'] = get_env_value('ZERODHA_ACCESS_TOKEN', zerodha.get('access_token'))
+            zerodha['request_token'] = get_env_value('ZERODHA_REQUEST_TOKEN', zerodha.get('request_token'))
             zerodha['user_id'] = get_env_value('ZERODHA_USER_ID', zerodha.get('user_id'))
             zerodha['password'] = get_env_value('ZERODHA_PASSWORD', zerodha.get('password'))
             zerodha['pin'] = get_env_value('ZERODHA_PIN', zerodha.get('pin'))
@@ -414,7 +424,7 @@ class ConfigLoader:
         risk['limits'].setdefault('max_concurrent_positions', 5)
         risk['limits'].setdefault('max_positions_per_symbol', 1)
         risk['limits'].setdefault('max_positions_per_strategy', 10)
-        risk['limits'].setdefault('max_exposure_pct', 10.0)
+        risk['limits'].setdefault('max_exposure_pct', 500.0)
         
         if 'daily' not in risk:
             risk['daily'] = {}
@@ -532,6 +542,8 @@ class ConfigLoader:
     def get_risk_parameters(self) -> RiskParameters:
         """Get risk parameters as a dataclass."""
         risk_config = self.get('risk_management', {})
+        per_trade_config = risk_config.get('per_trade', {})
+        limits_config = risk_config.get('limits', {})
         daily_config = risk_config.get('daily', {})
         stop_loss_config = risk_config.get('stop_loss', {})
         time_stop_config = risk_config.get('time_stop', {})
@@ -539,8 +551,8 @@ class ConfigLoader:
         circuit_breakers_config = risk_config.get('circuit_breakers', {})
         
         return RiskParameters(
-            max_per_trade_risk_pct=daily_config.get('max_per_trade_risk_pct', 0.5),
-            max_concurrent_positions=daily_config.get('max_concurrent_positions', 5),
+            max_per_trade_risk_pct=per_trade_config.get('max_risk_pct', 0.5),
+            max_concurrent_positions=limits_config.get('max_concurrent_positions', 5),
             max_daily_loss_pct=daily_config.get('max_loss_pct', 2.0),
             max_daily_profit_pct=daily_config.get('max_profit_pct', 4.0),
             trailing_stop_atr_multiplier=stop_loss_config.get('trailing_stop_atr_multiplier', 1.5),
@@ -548,7 +560,16 @@ class ConfigLoader:
             time_stop_time=parse_time(time_stop_config.get('square_off_time', '15:15')),
             max_spread_pct=protection_config.get('max_spread_pct', 0.15),
             slippage_buffer_pct=protection_config.get('slippage_buffer_pct', 0.05),
-            cooldown_seconds=circuit_breakers_config.get('cooldown_seconds', 60)
+            cooldown_seconds=circuit_breakers_config.get(
+                'cooldown_seconds',
+                (self.get('signal_aggregation.cooldown', {}) or {}).get('seconds_per_symbol', 60)),
+            max_exposure_pct=float(limits_config.get('max_exposure_pct', 500.0)),
+            max_leverage=float((risk_config.get('leverage', {}) or {}).get('max_leverage', 5.0)),
+            min_volume_for_entry=float(protection_config.get('min_volume_for_entry', 1000)),
+            max_consecutive_failures=int(circuit_breakers_config.get('consecutive_failures_limit', 3)),
+            use_trailing_stop=parse_bool(stop_loss_config.get('trailing_stop_enabled', True)),
+            trailing_activation_r=float(stop_loss_config.get('trailing_activation_r', 1.0)),
+            min_stop_loss_pct=float(stop_loss_config.get('min_stop_pct', 0.5))
         )
     
     def get_strategy_configs(self) -> List[StrategyConfig]:
@@ -561,15 +582,17 @@ class ConfigLoader:
         for name, weight in weights.items():
             try:
                 strategy_name = parse_strategy_name(name)
-                enabled = strategies_config.get('enabled', True)
-                timeframe = parse_timeframe(parameters.get(name, {}).get('timeframe', '1m'))
+                strategy_params = parameters.get(name, {}) or {}
+                enabled = (parse_bool(strategies_config.get('enabled', True)) and
+                           parse_bool(strategy_params.get('enabled', True)))
+                timeframe = parse_timeframe(strategy_params.get('timeframe', '1m'))
                 
                 configs.append(StrategyConfig(
                     name=strategy_name,
                     enabled=enabled,
-                    weight=weight,
+                    weight=float(weight),
                     timeframe=timeframe,
-                    parameters=parameters.get(name, {})
+                    parameters=strategy_params
                 ))
             except Exception as e:
                 print(f"Warning: Could not parse strategy config for {name}: {e}")

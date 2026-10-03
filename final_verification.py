@@ -107,6 +107,14 @@ def main():
         ("tests/test_models.py", "Models tests"),
         ("tests/test_config_loader.py", "Config loader tests"),
         ("tests/test_risk_manager.py", "Risk manager tests"),
+        ("tests/test_strategies_and_aggregation.py", "Strategy and aggregation tests"),
+        ("tests/test_backtester.py", "Backtester tests"),
+        ("tests/test_live_flow.py", "Live order flow tests"),
+        ("tests/test_zerodha_broker.py", "Zerodha adapter tests"),
+        ("tests/test_notifier_and_dashboard.py", "Notifier and dashboard tests"),
+        ("intraday_system/costs.py", "Transaction cost model"),
+        ("intraday_system/brokers/paper_broker.py", "Paper broker"),
+        ("intraday_system/brokers/zerodha_broker.py", "Zerodha broker"),
     ]
     
     passed = 0
@@ -171,9 +179,9 @@ def main():
     print("\n--- Checking Configuration Structure ---")
     
     config_checks = [
-        ("broker:", "Broker configuration"),
-        ("trading:", "Trading configuration"),
-        ("risk:", "Risk management configuration"),
+        ("\nbroker:", "Broker configuration"),
+        ("\nrisk_management:", "Risk management configuration"),
+        ("\nbacktester:", "Backtester configuration"),
         ("strategies:", "Strategy configurations"),
         ("notifications:", "Notification configuration"),
         ("logging:", "Logging configuration"),

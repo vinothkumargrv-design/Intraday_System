@@ -18,6 +18,7 @@ system:
   data_dir: "data"
   candle_db_path: "data/candles.sqlite"
   trade_journal_path: "data/trade_journal.csv"
+  status_file: "data/status.json"  # Live snapshot read by the dashboard
   log_file_path: "logs/trading_system.log"
   
   # System performance
@@ -223,6 +224,7 @@ strategies:
       trending_regime_only: true  # Only trade in trending markets
       use_trailing_stop: true
       trailing_atr_multiplier: 1.5
+      trend_strength_full_scale_pct: 0.5  # % from 20-bar SMA treated as full trend strength
 
 
 # =============================================================================
@@ -236,7 +238,8 @@ signal_aggregation:
   
   # Regime filter settings
   regime:
-    volatility_threshold: 0.75  # ATR percentile threshold
+    volatility_threshold: 0.75  # Block entries when ATR is above its 75th percentile
+    lookback_bars: 120  # 1-minute bars used to rank the current ATR
     trend_strength_threshold: 0.6
     use_vix_filter: false
     vix_max: 25.0  # Don't trade if VIX > 25
@@ -280,7 +283,7 @@ risk_management:
     max_concurrent_positions: 5
     max_positions_per_symbol: 1
     max_positions_per_strategy: 10
-    max_exposure_pct: 10.0  # 10% of equity max exposure
+    max_exposure_pct: 500.0  # Max gross notional exposure as % of equity (5x intraday leverage)
     
   # Daily limits
   daily:
@@ -291,9 +294,11 @@ risk_management:
   # Stop loss settings
   stop_loss:
     hard_stop_enabled: true
-    hard_stop_pct: 1.0  # 1% from entry
+    hard_stop_pct: 1.0  # Max stop distance: 1% from entry
+    min_stop_pct: 0.5   # Min stop distance: tighter strategy stops are widened (costs)
     trailing_stop_enabled: true
     trailing_stop_atr_multiplier: 1.5
+    trailing_activation_r: 1.0  # Start trailing once trade is 1R in profit
     use_tick_based_trailing: false
     tick_based_trailing_points: 5
     
@@ -301,7 +306,8 @@ risk_management:
   time_stop:
     enabled: true
     square_off_time: "15:15"  # 15:15 IST
-    pre_square_off_minutes: 5  # Start closing positions 5 minutes before
+    pre_square_off_minutes: 5  # No new entries in the last 5 minutes before square-off
+    enforce_market_hours: true  # Paper mode can disable with --ignore-market-hours
     
   # Spread and slippage protection
   protection:
@@ -481,8 +487,8 @@ backtester:
   
   # Data
   data:
-    source: "local"  # local, yahoo, alpha_vantage
-    data_dir: "data/backtest"
+    source: "local"  # local (CSV files) or synthetic (generated random-walk data)
+    data_dir: "data/historical"  # Contains <SYMBOL>.csv with timestamp,open,high,low,close,volume
     
   # Slippage and costs
   costs:
@@ -490,11 +496,12 @@ backtester:
     slippage_factor: 0.0005  # 0.05%
     
     simulate_commissions: true
-    brokerage_rate: 0.0003
-    exchange_fee_rate: 0.0005
-    stt_rate: 0.00025
-    gst_rate: 0.18
-    stamp_duty_rate: 0.0001
+    brokerage_rate: 0.0003       # 0.03% per order ...
+    brokerage_cap: 20.0          # ... capped at Rs 20 per order
+    exchange_fee_rate: 0.0000297 # NSE transaction charge (0.00297%) on turnover
+    stt_rate: 0.00025            # 0.025% on sell side (intraday)
+    gst_rate: 0.18               # 18% on brokerage + exchange fees
+    stamp_duty_rate: 0.00003     # 0.003% on buy side (intraday)
     
   # Execution
   execution:
@@ -504,7 +511,7 @@ backtester:
   # Performance metrics
   metrics:
     calculate: true
-    output_dir: "backtest_results"
+    output_dir: "results"
     generate_plots: true
     generate_reports: true
     

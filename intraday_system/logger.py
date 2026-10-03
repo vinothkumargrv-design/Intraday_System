@@ -40,7 +40,7 @@ class JSONFormatter(logging.Formatter):
         """Format log record as JSON."""
         log_data: Dict[str, Any] = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "timestamp_ist": datetime.now().astimezone().isoformat(),
+            "timestamp_local": datetime.now().astimezone().isoformat(),
             "level": record.levelname,
             "message": record.getMessage()
         }
@@ -99,9 +99,7 @@ class TextFormatter(logging.Formatter):
         
         # Timestamp
         if self.include_timestamps:
-            utc_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%fZ")
-            ist_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")
-            parts.append(f"[{utc_time} IST:{ist_time}]")
+            parts.append(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}]")
         
         # Level
         if self.include_level:
@@ -173,27 +171,63 @@ class TradingLogger(logging.Logger):
             extra = kwargs.get('extra', {})
             extra.update(custom_fields)
             kwargs['extra'] = extra
+        # Report the real call site rather than these wrapper methods
+        kwargs.setdefault('stacklevel', 2)
         super().log(level, msg, *args, **kwargs)
     
     def debug(self, msg: str, *args: Any, custom_fields: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
         """Debug level log."""
+        kwargs.setdefault('stacklevel', 3)
         self.log(logging.DEBUG, msg, *args, custom_fields=custom_fields, **kwargs)
     
     def info(self, msg: str, *args: Any, custom_fields: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
         """Info level log."""
+        kwargs.setdefault('stacklevel', 3)
         self.log(logging.INFO, msg, *args, custom_fields=custom_fields, **kwargs)
     
     def warning(self, msg: str, *args: Any, custom_fields: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
         """Warning level log."""
+        kwargs.setdefault('stacklevel', 3)
         self.log(logging.WARNING, msg, *args, custom_fields=custom_fields, **kwargs)
     
     def error(self, msg: str, *args: Any, custom_fields: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
         """Error level log."""
+        kwargs.setdefault('stacklevel', 3)
         self.log(logging.ERROR, msg, *args, custom_fields=custom_fields, **kwargs)
     
     def critical(self, msg: str, *args: Any, custom_fields: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
         """Critical level log."""
+        kwargs.setdefault('stacklevel', 3)
         self.log(logging.CRITICAL, msg, *args, custom_fields=custom_fields, **kwargs)
+    
+    # Structured event helpers (component argument kept for call-site clarity)
+    
+    def log_signal(self, component: str, signal_data: Dict[str, Any]) -> None:
+        """Log a strategy/aggregated signal event (DEBUG: signals are high-volume)."""
+        self.debug(
+            f"SIGNAL: {signal_data.get('strategy', signal_data.get('final_signal', ''))} -> "
+            f"{signal_data.get('signal', signal_data.get('final_signal', ''))} {signal_data.get('symbol', '')}",
+            custom_fields={"signal": signal_data, "event_type": "SIGNAL", "source": component},
+            stacklevel=4
+        )
+    
+    def log_order(self, component: str, order_data: Dict[str, Any]) -> None:
+        """Log an order event."""
+        self.info(
+            f"ORDER: {order_data.get('order_id', '')} {order_data.get('side', '')} "
+            f"{order_data.get('quantity', 0)} {order_data.get('symbol', '')} {order_data.get('type', '')}",
+            custom_fields={"order": order_data, "event_type": "ORDER", "source": component},
+            stacklevel=4
+        )
+    
+    def log_trade(self, component: str, trade_data: Dict[str, Any]) -> None:
+        """Log a completed trade."""
+        self.info(
+            f"TRADE: {trade_data.get('side', '')} {trade_data.get('quantity', 0)} "
+            f"{trade_data.get('symbol', '')} net {trade_data.get('net_pnl', 0)}",
+            custom_fields={"trade": trade_data, "event_type": "TRADE", "source": component},
+            stacklevel=4
+        )
 
 
 # =============================================================================
@@ -223,7 +257,28 @@ class LogManager:
         self._initialized = True
         self.config = config or {}
         self.loggers: Dict[str, TradingLogger] = {}
+        self._handlers: list = []
         self._setup_logging()
+    
+    def configure(self, config: Optional[Dict[str, Any]]) -> None:
+        """(Re)apply logging configuration, replacing handlers installed earlier."""
+        root = logging.getLogger()
+        for handler in self._handlers:
+            root.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+        self._handlers = []
+        self.config = config or {}
+        self._setup_logging()
+    
+    def _new_logger(self, component: str, level: int = logging.INFO) -> 'TradingLogger':
+        logger = TradingLogger(f"intraday_system.{component}", level)
+        # Created outside the logging manager, so attach it to the root logger
+        # explicitly; otherwise records never reach any handler.
+        logger.parent = logging.getLogger()
+        return logger
     
     def _setup_logging(self) -> None:
         """Setup logging configuration."""
@@ -260,11 +315,11 @@ class LogManager:
         # Setup file handler
         file_enabled = file_config.get('enabled', True)
         if file_enabled:
-            log_dir = Path(self.config.get('system', {}).get('log_file_path', 'logs')).parent
-            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = Path(file_config.get('path', 'logs/trading_system.log'))
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             
             file_handler = logging.handlers.RotatingFileHandler(
-                filename=file_config.get('path', 'logs/trading_system.log'),
+                filename=str(log_path),
                 maxBytes=file_config.get('max_size_mb', 10) * 1024 * 1024,
                 backupCount=file_config.get('max_backups', 5)
             )
@@ -273,14 +328,20 @@ class LogManager:
             
             # Add to root logger
             logging.getLogger().addHandler(file_handler)
+            self._handlers.append(file_handler)
         
         # Setup console handler
         console_enabled = console_config.get('enabled', True)
         if console_enabled:
             console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setFormatter(formatter)
+            # Console is for humans: plain text unless explicitly asked for JSON
+            if console_config.get('format', 'text') == 'json':
+                console_handler.setFormatter(formatter)
+            else:
+                console_handler.setFormatter(TextFormatter(include_function=False))
             console_handler.setLevel(getattr(logging, console_config.get('level', 'INFO').upper(), logging.INFO))
             logging.getLogger().addHandler(console_handler)
+            self._handlers.append(console_handler)
         
         # Set root logger level
         root_level = getattr(logging, log_config.get('level', 'INFO').upper(), logging.INFO)
@@ -304,27 +365,15 @@ class LogManager:
             level = component_levels.get(component, 'INFO')
             level_num = getattr(logging, level.upper(), logging.INFO)
             
-            # Create or get logger
-            logger_name = f"intraday_system.{component}"
-            logger = logging.getLogger(logger_name)
-            
-            # Set level
-            logger.setLevel(level_num)
-            
-            # Create trading logger wrapper
-            trading_logger = TradingLogger(logger_name, level_num)
-            trading_logger.setLevel(level_num)
-            
-            self.loggers[component] = trading_logger
+            if component in self.loggers:
+                self.loggers[component].setLevel(level_num)
+            else:
+                self.loggers[component] = self._new_logger(component, level_num)
     
     def get_logger(self, component: str) -> TradingLogger:
         """Get a logger for a specific component."""
         if component not in self.loggers:
-            # Create a new logger for unknown components
-            logger_name = f"intraday_system.{component}"
-            logger = logging.getLogger(logger_name)
-            trading_logger = TradingLogger(logger_name)
-            self.loggers[component] = trading_logger
+            self.loggers[component] = self._new_logger(component)
         
         return self.loggers[component]
     
@@ -426,7 +475,10 @@ _log_manager: Optional[LogManager] = None
 def setup_logging(config: Optional[Dict[str, Any]] = None) -> None:
     """Setup the logging system with the given configuration."""
     global _log_manager
-    _log_manager = LogManager(config)
+    if _log_manager is None:
+        _log_manager = LogManager(config)
+    else:
+        _log_manager.configure(config)
 
 
 def get_logger(component: str) -> TradingLogger:

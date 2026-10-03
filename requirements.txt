@@ -1,77 +1,23 @@
 # Rapid Fire Intraday Trading System - Dependencies
 # Python 3.11+ required
 
-# Core dependencies
-pyyaml>=6.0.0
-pandas>=2.0.0
-numpy>=1.24.0
+# Core
+pyyaml>=6.0
+pandas>=2.0
+numpy>=1.24
+aiohttp>=3.8          # data feed (imported at module level)
+websockets>=11.0      # generic WebSocket feeds
+tzdata; platform_system == "Windows"   # IANA timezones (Asia/Kolkata) for zoneinfo on Windows
 
-# Async and networking
-aiohttp>=3.8.0
-asyncio>=3.4.3
+# Backtest plots
+matplotlib>=3.7
 
-# Data handling and storage
-sqlite3>=3.41.0
+# Dashboard (streamlit run intraday_system/dashboard.py)
+streamlit>=1.46
+plotly>=5.14
 
-# Logging
-python-json-logger>=2.0.7
-
-# Trading and technical analysis
-# For TA-Lib compatibility (optional)
-# TA-Lib>=0.4.24 (requires separate installation)
-
-# Dashboard and visualization
-streamlit>=1.24.0
-plotly>=5.14.0
-matplotlib>=3.7.1
-
-# HTTP and WebSocket clients
-websockets>=11.0.0
-httpx>=0.24.0
-requests>=2.31.0
-
-# Configuration and utilities
-pydantic>=2.3.0
-python-dotenv>=1.0.0
-
-# For Zerodha Kite Connect (optional)
-# kiteconnect>=5.0.0
-
-# For Alpaca (optional)
-# alpaca-trade-api>=3.0.0
-
-# For Interactive Brokers (optional)
-# ib_insync>=0.9.84
+# Zerodha Kite Connect (only needed when broker.active is ZERODHA)
+kiteconnect>=5.0
 
 # Testing
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-pytest-mock>=3.11.0
-
-# Code quality
-mypy>=1.4.0
-black>=23.3.0
-flake8>=6.0.0
-isort>=5.12.0
-
-# Performance optimization (optional)
-# numba>=0.57.0
-# cython>=3.0.0
-
-# For notification system
-# python-telegram-bot>=20.0.0
-
-# For email notifications
-# secure-smtp>=0.1.0
-
-# Development dependencies
-jupyter>=1.0.0
-ipython>=8.12.0
-
-# Note: Some dependencies like TA-Lib, kiteconnect, alpaca-trade-api, 
-# and ib_insync are optional and only needed for specific broker integrations.
-# Install them as needed based on your broker choice.
-
-# For production deployment
-# gunicorn>=20.1.0
-# uvloop>=0.17.0
+pytest>=7.4

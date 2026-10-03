@@ -16,11 +16,11 @@ from .base_broker import BaseBroker, BrokerError, BrokerType as BaseBrokerType
 # Mapping of broker type strings to implementation modules
 BROKER_IMPLEMENTATIONS: Dict[str, str] = {
     'zerodha': 'intraday_system.brokers.zerodha_broker.ZerodhaBroker',
-    'alpaca': 'intraday_system.brokers.alpaca_broker.AlpacaBroker',
-    'interactive_brokers': 'intraday_system.brokers.ib_broker.InteractiveBrokersBroker',
     'paper': 'intraday_system.brokers.paper_broker.PaperBroker',
-    'simulation': 'intraday_system.brokers.simulation_broker.SimulationBroker',
 }
+
+# Declared in BrokerType but without an implementation yet
+NOT_IMPLEMENTED = {'alpaca', 'interactive_brokers', 'simulation'}
 
 # Cache for broker instances
 _broker_instances: Dict[str, BaseBroker] = {}
@@ -58,6 +58,10 @@ def get_broker(broker_type: str, config: Dict[str, Any]) -> BaseBroker:
     except ValueError:
         raise BrokerError(f"Unsupported broker type: {broker_type}")
     
+    if broker_type_lower in NOT_IMPLEMENTED:
+        raise BrokerError(f"Broker '{broker_type}' is not implemented yet "
+                          f"(available: {', '.join(BROKER_IMPLEMENTATIONS)})")
+    
     # Get implementation class
     module_path = BROKER_IMPLEMENTATIONS.get(broker_type_lower)
     if not module_path:
@@ -77,12 +81,12 @@ def get_broker(broker_type: str, config: Dict[str, Any]) -> BaseBroker:
         
         return broker
         
+    except BrokerError:
+        raise
     except ImportError as e:
         raise BrokerError(f"Failed to import broker module {module_path}: {e}")
-    except AttributeError as e:
-        raise BrokerError(f"Broker class {class_name} not found in {module_name}: {e}")
     except Exception as e:
-        raise BrokerError(f"Failed to create broker instance: {e}")
+        raise BrokerError(f"Failed to create {broker_type} broker: {type(e).__name__}: {e}")
 
 
 def get_broker_by_enum(broker_type: BaseBrokerType, config: Dict[str, Any]) -> BaseBroker:

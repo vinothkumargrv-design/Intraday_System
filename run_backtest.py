@@ -1,108 +1,94 @@
 #!/usr/bin/env python3
 """
-Simple backtest runner that avoids circular import issues.
+Backtest runner for the Rapid Fire Intraday Trading System.
+
+Examples:
+    # Backtest on CSV files in data/historical (<SYMBOL>.csv, 1-minute bars)
+    python run_backtest.py --data-dir data/historical --symbols RELIANCE TCS
+
+    # Quick demo on reproducible synthetic data
+    python run_backtest.py --synthetic --days 20 --symbols RELIANCE TCS INFY
 """
 
-import sys
-import os
+import argparse
 import asyncio
+import os
+import sys
 
-# Add the current directory to Python path
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Set up the intraday_system path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'intraday_system'))
+from intraday_system.backtester import Backtester
+from intraday_system.config_loader import load_config
+from intraday_system.logger import setup_logging
 
-async def main():
-    """Run a simple backtest demonstration."""
-    print("Starting Rapid Fire Intraday Trading System Backtest...")
-    print("=" * 60)
-    
-    try:
-        # Try to import core modules
-        print("Importing core modules...")
-        from intraday_system.models import (
-            SignalType, OrderType, OrderSide, StrategyName, 
-            Position, Trade, OHLCV, Tick
-        )
-        print("[OK] Models imported successfully")
-        
-        from intraday_system.logger import get_logger
-        print("[OK] Logger imported successfully")
-        
-        from intraday_system.config_loader import ConfigLoader
-        print("[OK] Config loader imported successfully")
-        
-        # Load configuration
-        print("\nLoading configuration...")
-        config_loader = ConfigLoader("config.yaml")
-        config = config_loader.load()
-        print("[OK] Configuration loaded")
-        print(f"  Trading: {config.get('trading', {}).get('paper_trading', True)}")
-        print(f"  Symbols: {config.get('trading', {}).get('symbols', [])}")
-        print(f"  Initial Capital: {config.get('trading', {}).get('initial_capital', 100000)}")
-        
-        # Try to import backtester
-        print("\nImporting backtester...")
-        from intraday_system.backtester import Backtester
-        print("[OK] Backtester imported successfully")
-        
-        # Create and run backtester
-        print("\nCreating backtester...")
-        backtester = Backtester(config)
-        print("[OK] Backtester created")
-        
-        print("\nSetting up backtester...")
-        await backtester.setup()
-        print("[OK] Backtester setup complete")
-        
-        print("\nLoading historical data...")
-        data_loaded = await backtester.load_historical_data()
-        if data_loaded:
-            print("[OK] Historical data loaded")
-            
-            print("\nRunning backtest...")
-            await backtester.run()
-            print("[OK] Backtest completed")
-            
-            # Print results
-            print("\n" + "=" * 60)
-            print("BACKTEST RESULTS")
-            print("=" * 60)
-            
-            results = backtester.get_results()
-            if results:
-                trades = results.get('trades', [])
-                metrics = results.get('performance_metrics', {})
-                
-                print(f"Total Trades: {len(trades)}")
-                print(f"Total PnL: {metrics.get('total_net_pnl', 0):.2f}")
-                print(f"Win Rate: {metrics.get('win_rate', 0):.2%}")
-                print(f"Sharpe Ratio: {metrics.get('sharpe_ratio', 0):.2f}")
-                print(f"Max Drawdown: {metrics.get('max_drawdown', 0):.2f}%")
-                
-                if trades:
-                    print(f"\nRecent Trades:")
-                    for trade in trades[-5:]:  # Show last 5 trades
-                        print(f"  {trade.get('symbol')}: {trade.get('side')} @ {trade.get('entry_price')} -> {trade.get('exit_price')} | PnL: {trade.get('net_pnl', 0):.2f}")
-        else:
-            print("[WARNING] No historical data found. Cannot run backtest.")
-            print("  Make sure you have historical data in the 'data/historical' directory.")
-            
-    except Exception as e:
-        print(f"\n[ERROR] Error: {e}")
-        import traceback
-        traceback.print_exc()
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run a Rapid Fire intraday backtest")
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    parser.add_argument("--symbols", nargs="+", help="Symbols to test (default: from config)")
+    parser.add_argument("--start", help="Start date YYYY-MM-DD (default: backtester.start_date)")
+    parser.add_argument("--end", help="End date YYYY-MM-DD (default: backtester.end_date)")
+    parser.add_argument("--data-dir", help="Directory with <SYMBOL>.csv 1-minute bars")
+    parser.add_argument("--synthetic", action="store_true",
+                        help="Generate synthetic data for symbols without a CSV file")
+    parser.add_argument("--days", type=int, default=20, help="Trading days of synthetic data")
+    parser.add_argument("--capital", type=float, help="Initial capital override")
+    parser.add_argument("--results-dir", default=None, help="Output directory (default: results)")
+    parser.add_argument("--no-save", action="store_true", help="Do not write result files")
+    return parser.parse_args()
+
+
+async def main() -> int:
+    args = parse_args()
+
+    config = load_config(args.config)
+    # Keep the console for the summary; details still go to the log file
+    config.setdefault('logging', {}).setdefault('console', {})['level'] = 'WARNING'
+    setup_logging(config)
+    if args.data_dir:
+        config.setdefault('backtester', {}).setdefault('data', {})['data_dir'] = args.data_dir
+    if args.capital:
+        config.setdefault('backtester', {})['initial_capital'] = args.capital
+
+    # With synthetic data and no explicit start date, don't filter by the
+    # configured calendar-year window
+    start, end = args.start, args.end
+    if args.synthetic and not args.start:
+        start = "2024-01-01"
+        end = end or "2100-01-01"
+
+    backtester = Backtester(
+        config,
+        start_date=start,
+        end_date=end,
+        symbols=args.symbols,
+        synthetic=args.synthetic or None,
+        synthetic_days=args.days,
+        results_dir=args.results_dir,
+    )
+    await backtester.setup()
+
+    if not await backtester.load_historical_data():
+        print(f"[ERROR] No historical data found in '{backtester.data_path}'.")
+        print("        Provide <SYMBOL>.csv files with columns "
+              "timestamp,open,high,low,close,volume or use --synthetic.")
         return 1
-    
-    print("\n" + "=" * 60)
-    print("Backtest completed successfully!")
+
+    await backtester.run(save=not args.no_save)
+    print(backtester.format_summary())
+
+    if backtester.trades:
+        print("\nLast trades:")
+        for t in backtester.trades[-5:]:
+            print(f"  {t.entry_timestamp:%Y-%m-%d %H:%M} {t.symbol:<10} {t.side.value:<4} "
+                  f"{t.entry_price:>10.2f} -> {t.exit_price:>10.2f}  qty {t.quantity:<6} "
+                  f"net {t.net_pnl:>10.2f}  [{t.tags[0]}]")
+    if not args.no_save:
+        print(f"\nResults written to {backtester.results_dir}/")
     return 0
 
+
 if __name__ == "__main__":
-    # For Windows asyncio compatibility
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    sys.exit(asyncio.run(main()))

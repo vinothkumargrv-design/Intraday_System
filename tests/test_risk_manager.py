@@ -1,354 +1,143 @@
 """
-Unit tests for risk_manager.py - Risk management module.
+Unit tests for risk_manager.py - position sizing, pre-trade checks,
+cooldowns, daily limits and the kill switch.
 """
 
+from datetime import datetime, timedelta
+
 import pytest
-import os
-from datetime import datetime, time
-from unittest.mock import Mock, MagicMock
 
-import sys
-
-# Add parent directory to path for imports
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-
-from intraday_system.models import (
-    Position,
-    PositionSide,
-    Order,
-    OrderSide,
-    OrderStatus,
-    OrderType,
-    StrategyName,
-    RiskParameters,
-    RiskState,
-    PortfolioState,
-    Tick,
-    SignalType
-)
-from intraday_system.risk_manager import RiskManager
-from intraday_system.config_loader import Config, RiskConfig, TradingConfig
+from intraday_system.models import OrderSide, Position, PositionSide
 
 
-class MockConfig:
-    """Mock configuration for testing."""
-    
-    def __init__(self):
-        self.trading = TradingConfig(
-            paper_trading=True,
-            initial_capital=100000.0,
-            symbols=["NIFTY", "BANKNIFTY"]
-        )
-        
-        self.risk = RiskConfig(
-            max_per_trade_risk_pct=0.5,
-            max_concurrent_positions=5,
-            max_daily_loss_pct=2.0,
-            max_daily_profit_pct=4.0,
-            trailing_stop_atr_multiplier=1.5,
-            hard_stop_loss_pct=1.0,
-            time_stop_time=time(15, 15),
-            max_spread_pct=0.15,
-            slippage_buffer_pct=0.05,
-            cooldown_seconds=60
-        )
-
-
-class TestRiskManagerInitialization:
-    """Test RiskManager initialization."""
-    
-    def test_risk_manager_init(self):
-        """Test RiskManager initialization."""
-        config = MockConfig()
-        portfolio_tracker = Mock()
-        system_state = Mock()
-        
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        assert risk_manager is not None
-        assert risk_manager.config == config
-        assert risk_manager.portfolio_tracker == portfolio_tracker
-        assert risk_manager.system_state == system_state
-        assert risk_manager._daily_pnl == 0.0
-        assert risk_manager._daily_pnl_pct == 0.0
-
-
-class TestRiskChecks:
-    """Test risk check methods."""
-    
-    def test_check_max_positions_pass(self):
-        """Test max positions check when under limit."""
-        config = MockConfig()
-        portfolio_tracker = Mock()
-        portfolio_tracker.get_num_open_positions.return_value = 2
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        result = risk_manager.check_max_positions("NIFTY")
-        
-        assert result.passed is True
-    
-    def test_check_max_positions_fail(self):
-        """Test max positions check when at limit."""
-        config = MockConfig()
-        config.risk.max_concurrent_positions = 2
-        
-        portfolio_tracker = Mock()
-        portfolio_tracker.get_num_open_positions.return_value = 2
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        result = risk_manager.check_max_positions("NIFTY")
-        
-        assert result.passed is False
-    
-    def test_check_position_in_symbol(self):
-        """Test existing position check."""
-        config = MockConfig()
-        portfolio_tracker = Mock()
-        portfolio_tracker.has_position.return_value = True
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        result = risk_manager.check_no_existing_position("NIFTY")
-        
-        assert result.passed is False
-        assert "already has" in result.reason.lower()
-    
-    def test_check_cooldown(self):
-        """Test cooldown check."""
-        config = MockConfig()
-        portfolio_tracker = Mock()
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        # Add symbol to cooldown
-        risk_manager._cooldown_symbols["NIFTY"] = datetime.now()
-        
-        result = risk_manager.check_cooldown("NIFTY")
-        
-        assert result.passed is False
-        assert "cooldown" in result.reason.lower()
+def _position(symbol='TCS', side=PositionSide.LONG, qty=10, price=1000.0):
+    return Position(symbol=symbol, side=side, quantity=qty, entry_price=price,
+                    entry_timestamp=datetime.now())
 
 
 class TestPositionSizing:
-    """Test position sizing calculations."""
-    
-    def test_calculate_position_size(self):
-        """Test position size calculation."""
-        config = MockConfig()
-        portfolio_tracker = Mock()
-        portfolio_tracker.get_current_equity.return_value = 100000.0
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        # Position size = (equity * risk_pct) / |entry - SL|
-        # = (100000 * 0.005) / |18000 - 17900| = 500 / 100 = 5
-        size = risk_manager.calculate_position_size("NIFTY", 18000.0, 17900.0)
-        
-        assert size == 5.0
-    
-    def test_calculate_position_size_sell(self):
-        """Test position size calculation for sell orders."""
-        config = MockConfig()
-        portfolio_tracker = Mock()
-        portfolio_tracker.get_current_equity.return_value = 100000.0
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        # For sell orders, SL is above entry
-        # Size = (100000 * 0.005) / |18000 - 18100| = 500 / 100 = 5
-        size = risk_manager.calculate_position_size("NIFTY", 18000.0, 18100.0, OrderSide.SELL)
-        
-        assert size == 5.0
+    def test_risk_based_size(self, paper_stack):
+        # 0.5% of 100k = 500 risk; 10 stop distance -> 50 shares
+        assert paper_stack.risk.calculate_position_size('TCS', 1000.0, 990.0) == 50
+
+    def test_short_side_uses_absolute_distance(self, paper_stack):
+        assert paper_stack.risk.calculate_position_size('TCS', 1000.0, 1010.0) == 50
+
+    def test_leverage_caps_notional(self, paper_stack):
+        # Tiny stop would mean 5000 shares; cap = 100k * 5x / 5 positions = 100k notional
+        assert paper_stack.risk.calculate_position_size('TCS', 1000.0, 999.9) == 100
+
+    def test_zero_stop_distance(self, paper_stack):
+        assert paper_stack.risk.calculate_position_size('TCS', 1000.0, 1000.0) == 0
 
 
-class TestRiskState:
-    """Test risk state management."""
-    
-    def test_get_state(self):
-        """Test getting risk state."""
-        config = MockConfig()
-        portfolio_tracker = Mock()
-        portfolio_tracker.get_current_equity.return_value = 100000.0
-        portfolio_tracker.get_num_open_positions.return_value = 2
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        # Add some cooldown symbols
-        risk_manager._cooldown_symbols["NIFTY"] = datetime.now()
-        
-        state = risk_manager.get_state()
-        
-        assert isinstance(state, RiskState)
-        assert state.daily_pnl == 0.0
-        assert state.open_positions_count == 2
-        assert len(state.cooldown_symbols) == 1
+class TestPreTradeChecks:
+    def test_all_checks_pass(self, paper_stack):
+        paper_stack.tick('TCS', 1000.0)
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 50, 1000.0, 990.0)
+        assert result.passed, result.reason
+
+    def test_requires_market_data(self, paper_stack):
+        result = paper_stack.risk.check_trade_risk('INFY', OrderSide.BUY, 10, 1000.0, 990.0)
+        assert not result.passed and 'No tick data' in result.reason
+
+    def test_existing_position_blocks(self, paper_stack):
+        paper_stack.tick('TCS', 1000.0)
+        paper_stack.portfolio.on_position_opened(_position('TCS'))
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 10, 1000.0, 990.0)
+        assert not result.passed and 'Existing position' in result.reason
+
+    def test_max_concurrent_positions(self, paper_stack):
+        paper_stack.tick('TCS', 1000.0)
+        for i in range(5):
+            paper_stack.portfolio.on_position_opened(_position(f'SYM{i}', qty=1))
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 10, 1000.0, 990.0)
+        assert not result.passed and 'Max concurrent positions' in result.reason
+
+    def test_exposure_limit(self, paper_stack):
+        paper_stack.tick('TCS', 1000.0)
+        # 500% of 100k equity = 500k max gross notional
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 600, 1000.0, 990.0)
+        assert not result.passed and 'Exposure limit' in result.reason
+
+    def test_wide_spread_blocks(self, paper_stack):
+        paper_stack.tick('TCS', 1000.0, spread=5.0)  # 0.5% > 0.15% max
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 10, 1000.0, 990.0)
+        assert not result.passed and 'Spread too wide' in result.reason
+
+    def test_low_volume_blocks(self, paper_stack):
+        paper_stack.tick('TCS', 1000.0, volume=10)
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 10, 1000.0, 990.0)
+        assert not result.passed and 'Insufficient volume' in result.reason
+
+    def test_cooldown_after_exit(self, paper_stack):
+        paper_stack.tick('TCS', 1000.0)
+        paper_stack.risk._state.cooldown_symbols['TCS'] = datetime.utcnow()
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 10, 1000.0, 990.0)
+        assert not result.passed and 'cooldown' in result.reason
+
+        paper_stack.risk._state.cooldown_symbols['TCS'] = datetime.utcnow() - timedelta(minutes=5)
+        assert paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 10, 1000.0, 990.0).passed
 
 
-class TestKillSwitch:
-    """Test kill switch functionality."""
-    
-    def test_check_kill_switch_daily_loss(self):
-        """Test kill switch on daily loss."""
-        config = MockConfig()
-        config.risk.max_daily_loss_pct = 2.0
-        
-        portfolio_tracker = Mock()
-        portfolio_tracker.get_initial_capital.return_value = 100000.0
-        portfolio_tracker.get_daily_pnl.return_value = -3000.0  # 3% loss
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        # Manually set daily PnL to trigger kill switch
-        risk_manager._daily_pnl = -3000.0
-        risk_manager._daily_pnl_pct = -3.0
-        
-        risk_manager.check_daily_limits()
-        
-        assert risk_manager._kill_switch_activated is True
-    
-    def test_check_kill_switch_daily_profit(self):
-        """Test kill switch on daily profit limit."""
-        config = MockConfig()
-        config.risk.max_daily_profit_pct = 4.0
-        
-        portfolio_tracker = Mock()
-        portfolio_tracker.get_initial_capital.return_value = 100000.0
-        portfolio_tracker.get_daily_pnl.return_value = 5000.0  # 5% profit
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        # Manually set daily PnL to trigger profit limit
-        risk_manager._daily_pnl = 5000.0
-        risk_manager._daily_pnl_pct = 5.0
-        
-        risk_manager.check_daily_limits()
-        
-        # Should activate kill switch on profit limit
-        assert risk_manager._daily_profit_limit_reached is True
+class TestDailyLimitsAndKillSwitch:
+    def _book_realized(self, stack, pnl):
+        from intraday_system.models import Trade
+        now = datetime.now()
+        trade = Trade(trade_id=f'T{pnl}', symbol='X', side=OrderSide.BUY, entry_price=100,
+                      exit_price=100 + pnl, quantity=1, entry_timestamp=now, exit_timestamp=now,
+                      pnl=pnl)
+        stack.portfolio.on_trade_closed(trade)
+        stack.risk.on_trade_closed(trade, trade.exit_price)
+
+    def test_daily_profit_target_stops_new_trades(self, paper_stack):
+        paper_stack.tick('TCS', 1000.0)
+        self._book_realized(paper_stack, 4500)  # 4.5% > 4% target
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 10, 1000.0, 990.0)
+        assert not result.passed and 'profit target' in result.reason
+        assert not paper_stack.risk.get_risk_state().kill_switch_activated
+
+    def test_daily_loss_limit_activates_kill_switch(self, paper_stack):
+        self._book_realized(paper_stack, -2500)  # 2.5% loss > 2% limit
+        state = paper_stack.risk.get_risk_state()
+        assert state.kill_switch_activated
+        assert state.daily_pnl == pytest.approx(-2500)
+
+    def test_kill_file_activates_kill_switch(self, paper_stack, tmp_path):
+        paper_stack.tick('TCS', 1000.0)
+        (tmp_path / 'KILL').write_text('stop')
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 10, 1000.0, 990.0)
+        assert not result.passed
+        assert paper_stack.risk.get_risk_state().kill_switch_activated
+
+    def test_consecutive_failures_activate_kill_switch(self, paper_stack):
+        paper_stack.tick('TCS', 1000.0)
+        for i in range(3):
+            paper_stack.risk.on_order_failed(f'O{i}', 'rejected')
+        result = paper_stack.risk.check_trade_risk('TCS', OrderSide.BUY, 10, 1000.0, 990.0)
+        assert not result.passed
+        assert paper_stack.risk.get_risk_state().kill_switch_activated
+
+    def test_fill_resets_failure_counter(self, paper_stack):
+        paper_stack.risk.on_order_failed('O1', 'rejected')
+        paper_stack.risk.on_order_filled('O2', 10, 1000.0)
+        assert paper_stack.risk.get_risk_state().consecutive_failures == 0
 
 
-class TestSpreadCheck:
-    """Test spread validation."""
-    
-    def test_check_spread_pass(self):
-        """Test spread check with acceptable spread."""
-        config = MockConfig()
-        portfolio_tracker = Mock()
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        tick = Tick(
-            symbol="NIFTY",
-            timestamp=datetime.now(),
-            last_price=18000.0,
-            bid_price=17999.5,
-            ask_price=18000.5
-        )
-        
-        result = risk_manager.check_spread(tick, OrderSide.BUY)
-        
-        # Spread is 1.0, which is (1.0/18000)*100 = 0.00555% < 0.15%
-        assert result.passed is True
-    
-    def test_check_spread_fail(self):
-        """Test spread check with excessive spread."""
-        config = MockConfig()
-        config.risk.max_spread_pct = 0.1  # 0.1% max spread
-        
-        portfolio_tracker = Mock()
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        tick = Tick(
-            symbol="NIFTY",
-            timestamp=datetime.now(),
-            last_price=18000.0,
-            bid_price=17900.0,  # Spread = 100
-            ask_price=18100.0
-        )
-        
-        result = risk_manager.check_spread(tick, OrderSide.BUY)
-        
-        # Spread is 200, which is (200/18000)*100 = 1.111% > 0.1%
-        assert result.passed is False
+class TestStopHelpers:
+    def test_stop_and_target_hits(self, paper_stack):
+        long_pos = _position(side=PositionSide.LONG)
+        long_pos.stop_loss, long_pos.take_profit = 990.0, 1020.0
+        assert paper_stack.risk.check_stop_loss_hit(long_pos, 989.0)
+        assert not paper_stack.risk.check_stop_loss_hit(long_pos, 995.0)
+        assert paper_stack.risk.check_take_profit_hit(long_pos, 1021.0)
 
+        short_pos = _position(side=PositionSide.SHORT)
+        short_pos.stop_loss, short_pos.take_profit = 1010.0, 980.0
+        assert paper_stack.risk.check_stop_loss_hit(short_pos, 1011.0)
+        assert paper_stack.risk.check_take_profit_hit(short_pos, 979.0)
 
-class TestMultipleRiskChecks:
-    """Test combined risk checks."""
-    
-    def test_check_all_risk_pass(self):
-        """Test all risk checks passing."""
-        config = MockConfig()
-        portfolio_tracker = Mock()
-        portfolio_tracker.has_position.return_value = False
-        portfolio_tracker.get_num_open_positions.return_value = 0
-        portfolio_tracker.get_current_equity.return_value = 100000.0
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        tick = Tick(
-            symbol="NIFTY",
-            timestamp=datetime.now(),
-            last_price=18000.0,
-            bid_price=17999.5,
-            ask_price=18000.5
-        )
-        
-        result = risk_manager.check_all_risk(
-            symbol="NIFTY",
-            side=OrderSide.BUY,
-            price=18000.0,
-            stop_loss=17900.0,
-            tick=tick
-        )
-        
-        assert result.passed is True
-    
-    def test_check_all_risk_fail_max_positions(self):
-        """Test all risk checks failing on max positions."""
-        config = MockConfig()
-        config.risk.max_concurrent_positions = 1
-        
-        portfolio_tracker = Mock()
-        portfolio_tracker.has_position.return_value = False
-        portfolio_tracker.get_num_open_positions.return_value = 1
-        portfolio_tracker.get_current_equity.return_value = 100000.0
-        
-        system_state = Mock()
-        risk_manager = RiskManager(config, portfolio_tracker, system_state)
-        
-        tick = Tick(
-            symbol="NIFTY",
-            timestamp=datetime.now(),
-            last_price=18000.0,
-            bid_price=17999.5,
-            ask_price=18000.5
-        )
-        
-        result = risk_manager.check_all_risk(
-            symbol="NIFTY",
-            side=OrderSide.BUY,
-            price=18000.0,
-            stop_loss=17900.0,
-            tick=tick
-        )
-        
-        assert result.passed is False
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    def test_default_stop_without_atr(self, paper_stack):
+        sl, tp = paper_stack.risk.calculate_stop_loss('TCS', 1000.0, OrderSide.BUY)
+        assert sl == pytest.approx(990.0)   # 1% hard stop
+        assert tp == pytest.approx(1020.0)  # 2R

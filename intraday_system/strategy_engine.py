@@ -25,13 +25,20 @@ import numpy as np
 import pandas as pd
 
 from intraday_system.config_loader import get_config_loader
-# Use dependency injection for data_feed to avoid circular imports
-# from intraday_system.data_feed import get_data_feed
+from intraday_system.data_feed import get_data_feed
 from intraday_system.logger import strategy_logger
 from intraday_system.models import (
     AggregationConfig, OHLCV, SignalType, StrategyConfig, StrategyName,
     StrategySignal, Symbol, Tick, TimeFrame, Timestamp
 )
+
+
+BAR_DURATION = {
+    TimeFrame._1M: timedelta(minutes=1),
+    TimeFrame._5M: timedelta(minutes=5),
+    TimeFrame._15M: timedelta(minutes=15),
+    TimeFrame._1H: timedelta(hours=1),
+}
 
 
 # =============================================================================
@@ -59,6 +66,14 @@ class BaseStrategy:
         self.signals_generated = 0
         self.signals_triggered = 0
         self.last_signal_time: Dict[Symbol, Timestamp] = {}
+        
+        # Optional simulated clock (set by the backtester so signals carry
+        # market-data time instead of wall-clock time)
+        self.clock: Optional[Timestamp] = None
+    
+    def _now(self) -> Timestamp:
+        """Current time: simulated clock if set, otherwise UTC wall clock."""
+        return self.clock if self.clock is not None else datetime.utcnow()
     
     def initialize(self) -> None:
         """Initialize strategy-specific resources."""
@@ -104,7 +119,8 @@ class BaseStrategy:
             return None
         
         self.signals_generated += 1
-        self.last_signal_time[symbol] = datetime.utcnow()
+        now = self._now()
+        self.last_signal_time[symbol] = now
         
         return StrategySignal(
             strategy=self.name,
@@ -112,7 +128,7 @@ class BaseStrategy:
             confidence=min(1.0, max(0.0, confidence)),
             reason=reason,
             symbol=symbol,
-            timestamp=datetime.utcnow(),
+            timestamp=now,
             suggested_sl=suggested_sl,
             suggested_tp=suggested_tp,
             timeframe=self.timeframe,
@@ -152,6 +168,8 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self._opening_ranges: Dict[Symbol, Tuple[float, float]] = {}  # (high, low)
         self._range_established: Dict[Symbol, bool] = {}
         self._trading_start_time: Dict[Symbol, time] = {}
+        # Breakout directions already signalled this session (fire once each)
+        self._signalled: Dict[Symbol, set] = {}
         
         # Market open time (IST)
         self.market_open = time(9, 15)  # 9:15 AM IST
@@ -159,8 +177,10 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
     
     def initialize(self) -> None:
         """Initialize opening range tracking."""
-        data_feed = get_data_feed()
-        symbols = data_feed.symbols
+        try:
+            symbols = get_data_feed().symbols
+        except Exception:
+            symbols = []
         
         for symbol in symbols:
             self._opening_ranges[symbol] = (0, float('inf'))
@@ -188,9 +208,14 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         if self._opening_ranges.get(symbol):
             range_high, range_low = self._opening_ranges[symbol]
             range_size = range_high - range_low
+            if range_size <= 0 or range_low == float('inf'):
+                return None
+            
+            signalled = self._signalled.setdefault(symbol, set())
             
             # Check for breakout above range
-            if ohlcv.close > range_high * (1 + self.orb_multiplier * 0.01):
+            if ohlcv.close > range_high * (1 + self.orb_multiplier * 0.01) and SignalType.BUY not in signalled:
+                signalled.add(SignalType.BUY)
                 # Calculate confidence based on breakout strength
                 breakout_strength = (ohlcv.close - range_high) / range_size
                 confidence = min(0.8, 0.5 + breakout_strength * 0.3)
@@ -209,7 +234,8 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
                 )
             
             # Check for breakout below range
-            elif ohlcv.close < range_low * (1 - self.orb_multiplier * 0.01):
+            elif ohlcv.close < range_low * (1 - self.orb_multiplier * 0.01) and SignalType.SELL not in signalled:
+                signalled.add(SignalType.SELL)
                 # Calculate confidence based on breakout strength
                 breakout_strength = (range_low - ohlcv.close) / range_size
                 confidence = min(0.8, 0.5 + breakout_strength * 0.3)
@@ -241,7 +267,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         
         # Initialize if not exists
         if symbol not in self._opening_ranges:
-            self._opening_ranges[symbol] = (ohlcv.low, ohlcv.high)
+            self._opening_ranges[symbol] = (ohlcv.high, ohlcv.low)
         
         # Update range
         current_high, current_low = self._opening_ranges[symbol]
@@ -257,7 +283,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         current_seconds = current_time.hour * 3600 + current_time.minute * 60
         end_seconds = open_seconds + self.orb_minutes * 60
         
-        return open_seconds <= current_seconds <= end_seconds
+        return open_seconds <= current_seconds < end_seconds
     
     def _is_after_opening_range(self, current_time: time) -> bool:
         """Check if current time is after the opening range period."""
@@ -265,12 +291,13 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         current_seconds = current_time.hour * 3600 + current_time.minute * 60
         end_seconds = open_seconds + self.orb_minutes * 60
         
-        return current_seconds > end_seconds
+        return current_seconds >= end_seconds
     
     def reset(self, symbol: Symbol) -> None:
         """Reset strategy for a symbol (e.g., at market close)."""
         self._range_established[symbol] = False
         self._opening_ranges[symbol] = (0, float('inf'))
+        self._signalled.pop(symbol, None)
 
 
 class VWAPMeanReversionStrategy(BaseStrategy):
@@ -639,10 +666,12 @@ class EMACrossoverScalperStrategy(BaseStrategy):
         if len(data) < period:
             return None
         
-        weights = np.exp(np.linspace(-1., 0., period))
-        weights /= weights.sum()
-        
-        return float(np.convolve(data[-period:], weights, mode='valid')[0])
+        # Standard EMA seeded with the SMA of the first `period` values
+        alpha = 2.0 / (period + 1)
+        ema = sum(data[:period]) / period
+        for price in data[period:]:
+            ema = alpha * price + (1 - alpha) * ema
+        return float(ema)
     
     def _calculate_rsi(self, data: List[float], period: int) -> Optional[float]:
         """Calculate Relative Strength Index."""
@@ -692,67 +721,55 @@ class EMACrossoverScalperStrategy(BaseStrategy):
         
         current_price = ohlcv.close
         
-        # Check for bullish crossover (fast EMA crosses above slow EMA)
-        if ema_fast > ema_slow:
-            # Check if this is a new crossover
-            was_bearish = self._prev_crossover.get(symbol, None)
-            if was_bearish is False or was_bearish is None:
-                # Check RSI filter
-                if self.rsi_filter_enabled:
-                    if rsi is not None and rsi < self.rsi_min:
-                        # Don't buy if RSI is too low (oversold, wait for recovery)
-                        return None
-                
-                confidence = 0.7
-                if rsi is not None:
-                    confidence += (rsi / 100) * 0.1  # Higher RSI = slightly higher confidence
-                
-                sl_distance = atr * self.sl_atr_multiplier if atr else ohlcv.range * 0.5
-                tp_distance = atr * self.tp_atr_multiplier if atr else ohlcv.range * 1.0
-                
-                return self._create_signal(
-                    symbol=symbol,
-                    signal=SignalType.BUY,
-                    confidence=confidence,
-                    reason=f"EMA Crossover: Fast EMA ({ema_fast:.2f}) crossed above Slow EMA ({ema_slow:.2f})",
-                    suggested_sl=current_price - sl_distance,
-                    suggested_tp=current_price + tp_distance
-                )
+        # Detect a crossover: the fast/slow relationship must flip relative to
+        # the previous bar. The first observation only seeds the state.
+        is_bullish = ema_fast > ema_slow
+        prev_bullish = self._prev_crossover.get(symbol)
+        self._prev_crossover[symbol] = is_bullish
         
-        # Check for bearish crossover (fast EMA crosses below slow EMA)
-        elif ema_fast < ema_slow:
-            # Check if this is a new crossover
-            was_bullish = self._prev_crossover.get(symbol, None)
-            if was_bullish is True or was_bullish is None:
-                # Check RSI filter
-                if self.rsi_filter_enabled:
-                    if rsi is not None and rsi > self.rsi_max:
-                        # Don't sell if RSI is too high (overbought, wait for pullback)
-                        return None
-                
-                confidence = 0.7
-                if rsi is not None:
-                    confidence += ((100 - rsi) / 100) * 0.1  # Lower RSI = slightly higher confidence
-                
-                sl_distance = atr * self.sl_atr_multiplier if atr else ohlcv.range * 0.5
-                tp_distance = atr * self.tp_atr_multiplier if atr else ohlcv.range * 1.0
-                
-                return self._create_signal(
-                    symbol=symbol,
-                    signal=SignalType.SELL,
-                    confidence=confidence,
-                    reason=f"EMA Crossover: Fast EMA ({ema_fast:.2f}) crossed below Slow EMA ({ema_slow:.2f})",
-                    suggested_sl=current_price + sl_distance,
-                    suggested_tp=current_price - tp_distance
-                )
+        if prev_bullish is None or prev_bullish == is_bullish or ema_fast == ema_slow:
+            return None
         
-        # Update crossover state
-        if ema_fast > ema_slow:
-            self._prev_crossover[symbol] = True
-        else:
-            self._prev_crossover[symbol] = False
+        sl_distance = atr * self.sl_atr_multiplier if atr else ohlcv.range * 0.5
+        tp_distance = atr * self.tp_atr_multiplier if atr else ohlcv.range * 1.0
         
-        return None
+        # Bullish crossover (fast EMA crosses above slow EMA)
+        if is_bullish:
+            # Don't buy if RSI is too low (oversold, wait for recovery)
+            if self.rsi_filter_enabled and rsi is not None and rsi < self.rsi_min:
+                return None
+            
+            confidence = 0.7
+            if rsi is not None:
+                confidence += (rsi / 100) * 0.1  # Higher RSI = slightly higher confidence
+            
+            return self._create_signal(
+                symbol=symbol,
+                signal=SignalType.BUY,
+                confidence=confidence,
+                reason=f"EMA Crossover: Fast EMA ({ema_fast:.2f}) crossed above Slow EMA ({ema_slow:.2f})",
+                suggested_sl=current_price - sl_distance,
+                suggested_tp=current_price + tp_distance
+            )
+        
+        # Bearish crossover (fast EMA crosses below slow EMA)
+        # Don't sell if RSI is too high (overbought, wait for pullback)
+        if self.rsi_filter_enabled and rsi is not None and rsi > self.rsi_max:
+            return None
+        
+        confidence = 0.7
+        if rsi is not None:
+            confidence += ((100 - rsi) / 100) * 0.1  # Lower RSI = slightly higher confidence
+        
+        return self._create_signal(
+            symbol=symbol,
+            signal=SignalType.SELL,
+            confidence=confidence,
+            reason=f"EMA Crossover: Fast EMA ({ema_fast:.2f}) crossed below Slow EMA ({ema_slow:.2f})",
+            suggested_sl=current_price + sl_distance,
+            suggested_tp=current_price - tp_distance
+        )
+    
 
 
 class OrderFlowImbalanceStrategy(BaseStrategy):
@@ -917,8 +934,10 @@ class OrderFlowImbalanceStrategy(BaseStrategy):
     
     def _get_average_volume(self, symbol: Symbol) -> float:
         """Get average volume for a symbol."""
-        data_feed = get_data_feed()
-        ohlcv_data = data_feed.cache.get_ohlcv(symbol, TimeFrame._1M, limit=20)
+        try:
+            ohlcv_data = get_data_feed().cache.get_ohlcv(symbol, TimeFrame._1M, limit=20)
+        except Exception:
+            ohlcv_data = []
         
         if not ohlcv_data:
             return 1000  # Default
@@ -947,6 +966,8 @@ class SupertrendStrategy(BaseStrategy):
         self.trending_regime_only = self.parameters.get('trending_regime_only', True)
         self.use_trailing_stop = self.parameters.get('use_trailing_stop', True)
         self.trailing_atr_multiplier = self.parameters.get('trailing_atr_multiplier', 1.5)
+        # Distance from the 20-bar SMA (in %) that counts as full trend strength
+        self.trend_full_scale_pct = self.parameters.get('trend_strength_full_scale_pct', 0.5)
         
         # Track Supertrend values per symbol
         self._supertrend: Dict[Symbol, float] = {}
@@ -958,6 +979,12 @@ class SupertrendStrategy(BaseStrategy):
         
         # Track trend strength
         self._trend_strength: Dict[Symbol, float] = {}
+        
+        # Direction as of the previous bar (to detect flips)
+        self._prev_direction_cache: Dict[Symbol, Optional[int]] = {}
+        
+        # Incremental ATR / band state per symbol
+        self._st_state: Dict[Symbol, Dict[str, Any]] = {}
     
     def on_bar(self, ohlcv: OHLCV) -> Optional[StrategySignal]:
         """Process new OHLCV bar for Supertrend calculation."""
@@ -975,13 +1002,14 @@ class SupertrendStrategy(BaseStrategy):
         self._lows[symbol].append(ohlcv.low)
         
         # Keep only necessary history
-        max_history = self.atr_period * 2
+        max_history = max(self.atr_period * 2, 20)
         if len(self._close_prices[symbol]) > max_history:
             self._close_prices[symbol] = self._close_prices[symbol][-max_history:]
             self._highs[symbol] = self._highs[symbol][-max_history:]
             self._lows[symbol] = self._lows[symbol][-max_history:]
         
-        # Calculate Supertrend and ATR
+        # Remember the direction before this bar, then recalculate
+        self._prev_direction_cache[symbol] = self._supertrend_direction.get(symbol)
         self._calculate_supertrend(symbol)
         self._calculate_trend_strength(symbol)
         
@@ -989,63 +1017,58 @@ class SupertrendStrategy(BaseStrategy):
         return self._check_signal(symbol, ohlcv)
     
     def _calculate_supertrend(self, symbol: Symbol) -> None:
-        """Calculate Supertrend for a symbol."""
+        """
+        Incrementally update the Supertrend for the latest bar.
+        
+        Standard definition: Wilder ATR, basic bands at hl2 +/- multiplier*ATR,
+        final bands that only tighten while price respects them, and a
+        direction that flips when the close crosses the active band.
+        """
         closes = self._close_prices.get(symbol, [])
         highs = self._highs.get(symbol, [])
         lows = self._lows.get(symbol, [])
-        
-        if len(closes) < self.atr_period + 1:
+        if not closes:
             return
         
-        # Calculate ATR
-        true_ranges = []
-        for i in range(1, len(highs)):
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i-1]),
-                abs(lows[i] - closes[i-1])
-            )
-            true_ranges.append(tr)
+        state = self._st_state.setdefault(symbol, {'count': 0, 'atr': None, 'prev_close': None,
+                                                   'upper': None, 'lower': None, 'tr_sum': 0.0})
+        high, low, close = highs[-1], lows[-1], closes[-1]
+        prev_close = state['prev_close']
+        tr = high - low if prev_close is None else max(high - low, abs(high - prev_close),
+                                                       abs(low - prev_close))
+        state['count'] += 1
+        if state['count'] <= self.atr_period:
+            state['tr_sum'] += tr
+            state['prev_close'] = close
+            if state['count'] < self.atr_period:
+                return
+            state['atr'] = state['tr_sum'] / self.atr_period
+        else:
+            state['atr'] = (state['atr'] * (self.atr_period - 1) + tr) / self.atr_period
         
-        atr = sum(true_ranges[-self.atr_period:]) / self.atr_period
+        atr = state['atr']
+        hl2 = (high + low) / 2
+        basic_upper = hl2 + self.multiplier * atr
+        basic_lower = hl2 - self.multiplier * atr
+        prev_upper, prev_lower = state['upper'], state['lower']
+        
+        upper = basic_upper if (prev_upper is None or basic_upper < prev_upper
+                                or (prev_close is not None and prev_close > prev_upper)) else prev_upper
+        lower = basic_lower if (prev_lower is None or basic_lower > prev_lower
+                                or (prev_close is not None and prev_close < prev_lower)) else prev_lower
+        
+        direction = self._supertrend_direction.get(symbol)
+        if direction is None:
+            direction = 1 if close >= hl2 else -1
+        elif direction == 1 and close < lower:
+            direction = -1
+        elif direction == -1 and close > upper:
+            direction = 1
+        
+        state.update(upper=upper, lower=lower, prev_close=close)
         self._atr[symbol] = atr
-        
-        # Calculate Supertrend
-        hl2 = [(highs[i] + lows[i]) / 2 for i in range(len(highs))]
-        
-        upper_band = [hl2[i] + (self.multiplier * atr) for i in range(len(hl2))]
-        lower_band = [hl2[i] - (self.multiplier * atr) for i in range(len(hl2))]
-        
-        # Initialize Supertrend
-        st = []
-        direction = []
-        
-        for i in range(len(closes)):
-            if i == 0:
-                st.append(upper_band[i] if closes[i] > upper_band[i] else lower_band[i])
-                direction.append(1 if closes[i] > upper_band[i] else -1)
-            else:
-                if direction[i-1] == 1:
-                    new_st = max(lower_band[i], st[i-1])
-                    if closes[i] > upper_band[i]:
-                        new_st = lower_band[i]
-                        new_direction = 1
-                    else:
-                        new_direction = 1
-                else:
-                    new_st = min(upper_band[i], st[i-1])
-                    if closes[i] < lower_band[i]:
-                        new_st = upper_band[i]
-                        new_direction = -1
-                    else:
-                        new_direction = -1
-                
-                st.append(new_st)
-                direction.append(new_direction)
-        
-        if st:
-            self._supertrend[symbol] = st[-1]
-            self._supertrend_direction[symbol] = direction[-1]
+        self._supertrend_direction[symbol] = direction
+        self._supertrend[symbol] = lower if direction == 1 else upper
     
     def _calculate_trend_strength(self, symbol: Symbol) -> None:
         """Calculate trend strength for a symbol."""
@@ -1060,7 +1083,7 @@ class SupertrendStrategy(BaseStrategy):
         price_deviation = abs(closes[-1] - sma) / sma * 100
         
         # Normalize to 0-1 range
-        self._trend_strength[symbol] = min(1.0, price_deviation / 5.0)
+        self._trend_strength[symbol] = min(1.0, price_deviation / self.trend_full_scale_pct)
     
     def _check_signal(self, symbol: Symbol, ohlcv: OHLCV) -> Optional[StrategySignal]:
         """Check for Supertrend signal."""
@@ -1074,55 +1097,42 @@ class SupertrendStrategy(BaseStrategy):
         
         current_price = ohlcv.close
         
+        # Only act on an actual flip of direction (not on the first observation)
+        previous = self._prev_direction(symbol)
+        if previous is None or previous == direction:
+            return None
+        
         # Check if we're in a trending regime (if required)
         if self.trending_regime_only and trend_strength < 0.5:
             return None
         
-        # Check for buy signal (price crosses above Supertrend)
+        # Price is above the Supertrend after flipping up -> BUY
         if direction == 1 and current_price > supertrend:
-            # Only trigger if direction has changed
-            if self._prev_direction(symbol) != 1:
-                confidence = 0.6 + (trend_strength * 0.2)
-                
-                return self._create_signal(
-                    symbol=symbol,
-                    signal=SignalType.BUY,
-                    confidence=confidence,
-                    reason=f"Supertrend: Price {current_price:.2f} crossed above ST {supertrend:.2f}, Direction=UP",
-                    suggested_sl=current_price - (atr * self.trailing_atr_multiplier) if self.use_trailing_stop else supertrend,
-                    suggested_tp=current_price + (atr * 2)  # 2x ATR
-                )
+            return self._create_signal(
+                symbol=symbol,
+                signal=SignalType.BUY,
+                confidence=0.6 + (trend_strength * 0.2),
+                reason=f"Supertrend: Price {current_price:.2f} crossed above ST {supertrend:.2f}, Direction=UP",
+                suggested_sl=current_price - (atr * self.trailing_atr_multiplier) if self.use_trailing_stop else supertrend,
+                suggested_tp=current_price + (atr * 2)  # 2x ATR
+            )
         
-        # Check for sell signal (price crosses below Supertrend)
-        elif direction == -1 and current_price < supertrend:
-            # Only trigger if direction has changed
-            if self._prev_direction(symbol) != -1:
-                confidence = 0.6 + (trend_strength * 0.2)
-                
-                return self._create_signal(
-                    symbol=symbol,
-                    signal=SignalType.SELL,
-                    confidence=confidence,
-                    reason=f"Supertrend: Price {current_price:.2f} crossed below ST {supertrend:.2f}, Direction=DOWN",
-                    suggested_sl=current_price + (atr * self.trailing_atr_multiplier) if self.use_trailing_stop else supertrend,
-                    suggested_tp=current_price - (atr * 2)  # 2x ATR
-                )
+        # Price is below the Supertrend after flipping down -> SELL
+        if direction == -1 and current_price < supertrend:
+            return self._create_signal(
+                symbol=symbol,
+                signal=SignalType.SELL,
+                confidence=0.6 + (trend_strength * 0.2),
+                reason=f"Supertrend: Price {current_price:.2f} crossed below ST {supertrend:.2f}, Direction=DOWN",
+                suggested_sl=current_price + (atr * self.trailing_atr_multiplier) if self.use_trailing_stop else supertrend,
+                suggested_tp=current_price - (atr * 2)  # 2x ATR
+            )
         
         return None
     
     def _prev_direction(self, symbol: Symbol) -> Optional[int]:
-        """Get previous Supertrend direction."""
-        # Store previous direction in a temporary cache
-        if not hasattr(self, '_prev_direction_cache'):
-            self._prev_direction_cache = {}
-        
-        current = self._supertrend_direction.get(symbol)
-        prev = self._prev_direction_cache.get(symbol)
-        
-        # Update cache
-        self._prev_direction_cache[symbol] = current
-        
-        return prev
+        """Get the Supertrend direction as of the previous bar."""
+        return self._prev_direction_cache.get(symbol)
 
 
 # =============================================================================
@@ -1228,6 +1238,7 @@ class StrategyEngine:
                 continue
             
             try:
+                strategy.clock = tick.timestamp  # Signals carry market-data time
                 signal = strategy.on_tick(tick)
                 if signal:
                     self._publish_signal(signal)
@@ -1254,6 +1265,8 @@ class StrategyEngine:
                 continue
             
             try:
+                # Bars are published when they close; stamp signals with the close time
+                strategy.clock = ohlcv.timestamp + BAR_DURATION.get(ohlcv.timeframe, timedelta(0))
                 signal = strategy.on_bar(ohlcv)
                 if signal:
                     self._publish_signal(signal)
