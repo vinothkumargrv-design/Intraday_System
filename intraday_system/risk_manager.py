@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time as time_module
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -38,6 +39,15 @@ from intraday_system.portfolio_tracker import get_portfolio_tracker
 # =============================================================================
 # RISK MANAGER
 # =============================================================================
+
+def _local_now(timezone_name: str) -> datetime:
+    """Current wall-clock time in the exchange timezone (naive if unavailable)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None)
+    except Exception:
+        return datetime.now()
+
 
 class RiskManager:
     """
@@ -61,7 +71,8 @@ class RiskManager:
             consecutive_failures=0,
             kill_switch_activated=False
         )
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()  # Re-entrant: checks may trigger the kill switch
+        self.subscribers: List[Callable] = []
         
         # Track trades and positions
         self._open_trades: Dict[str, Trade] = {}
@@ -93,18 +104,33 @@ class RiskManager:
         # Start kill switch file monitor
         self._start_kill_file_monitor()
         
-        # Load daily start
+        self._daily_start = self._now().date()
+        self.enforce_market_hours = bool(self.system_config.get('risk_management', {}).get(
+            'time_stop', {}).get('enforce_market_hours', True))
+    
+    def _now(self) -> datetime:
         timezone = self.system_config.get('system', {}).get('timezone', 'Asia/Kolkata')
-        now = datetime.now()
-        
-        # Convert to IST if needed
-        try:
-            import pytz
-            tz = pytz.timezone(timezone)
-            now_ist = now.astimezone(tz)
-            self._daily_start = now_ist.date()
-        except Exception:
-            self._daily_start = now.date()
+        return _local_now(timezone)
+    
+    def _roll_day_if_needed(self) -> None:
+        """Reset daily counters when the exchange date changes."""
+        today = self._now().date()
+        if today != self._daily_start:
+            self.on_end_of_day()
+    
+    def _refresh_state(self) -> None:
+        """Derive PnL, exposure and position count from the portfolio ledger."""
+        self._roll_day_if_needed()
+        portfolio = get_portfolio_tracker()
+        equity = portfolio.get_current_equity()
+        daily_pnl = portfolio.get_daily_pnl()
+        exposure = portfolio.get_gross_exposure()
+        with self._state_lock:
+            self._state.daily_pnl = daily_pnl
+            self._state.daily_pnl_pct = daily_pnl / portfolio.initial_capital * 100 if portfolio.initial_capital else 0.0
+            self._state.current_exposure = exposure
+            self._state.current_exposure_pct = exposure / equity * 100 if equity > 0 else 0.0
+            self._state.open_positions_count = portfolio.get_num_open_positions()
     
     def start(self) -> None:
         """Start the risk manager."""
@@ -144,9 +170,7 @@ class RiskManager:
                 risk_pct = risk_pct / 100.0
             
             # Get equity
-            portfolio_tracker = get_portfolio_tracker()
-            portfolio = portfolio_tracker.get_portfolio_state()
-            equity = portfolio.equity
+            equity = get_portfolio_tracker().get_current_equity()
             
             # Calculate stop loss distance
             sl_distance = abs(entry_price - stop_loss)
@@ -168,8 +192,15 @@ class RiskManager:
                 quantity = (quantity // lot_size) * lot_size
                 quantity = max(lot_size, quantity)
             
-            # Ensure quantity is at least 1
-            quantity = max(1, int(quantity))
+            # Cap notional so all concurrent positions fit within the leverage limit
+            max_notional = equity * self.config.max_leverage / max(self.config.max_concurrent_positions, 1)
+            if entry_price > 0:
+                quantity = min(quantity, int(max_notional / entry_price))
+            
+            if quantity < 1:
+                self.logger.warning(f"Position size for {symbol} rounds to zero")
+                return 0
+            quantity = int(quantity)
             
             self.logger.debug(f"Position size for {symbol}: entry={entry_price:.2f}, "
                             f"SL={stop_loss:.2f}, risk={risk_pct*100:.2f}%, "
@@ -216,6 +247,7 @@ class RiskManager:
         Returns:
             RiskCheckResult with passed=True/False and reason
         """
+        self._refresh_state()
         checks = [
             # 1. Kill switch check
             self._check_kill_switch(),
@@ -261,41 +293,39 @@ class RiskManager:
         return RiskCheckResult(
             passed=True,
             reason="All risk checks passed",
-            details={'checks': [c.to_dict() for c in checks]}
+            details={'checks': [c.reason for c in checks]}
         )
     
     def _check_kill_switch(self) -> RiskCheckResult:
         """Check if kill switch is activated."""
         with self._state_lock:
-            if self._state.kill_switch_activated:
-                return RiskCheckResult(
-                    passed=False,
-                    reason="Kill switch activated - all trading halted"
-                )
-            
-            # Check kill file
-            if self._check_kill_file():
-                self._activate_kill_switch("Manual kill file detected")
-                return RiskCheckResult(
-                    passed=False,
-                    reason="Manual kill file detected - kill switch activated"
-                )
+            activated = self._state.kill_switch_activated
+        if activated:
+            return RiskCheckResult(passed=False, reason="Kill switch activated - all trading halted")
+        
+        if self._check_kill_file():
+            self._activate_kill_switch("Manual kill file detected")
+            return RiskCheckResult(passed=False,
+                                   reason="Manual kill file detected - kill switch activated")
         
         return RiskCheckResult(passed=True, reason="Kill switch not activated")
     
     def _check_daily_loss_limit(self) -> RiskCheckResult:
         """Check if daily loss limit has been reached."""
+        max_loss_pct = self.config.max_daily_loss_pct
         with self._state_lock:
-            max_loss_pct = self.config.max_daily_loss_pct
             current_loss_pct = -self._state.daily_pnl_pct
-            
-            if current_loss_pct >= max_loss_pct:
-                # Activate kill switch
+        
+        if current_loss_pct >= max_loss_pct:
+            # Activated outside the state lock: square-off calls into other components
+            kill_enabled = self.system_config.get('risk_management', {}).get(
+                'circuit_breakers', {}).get('daily_loss_kill_switch', True)
+            if kill_enabled:
                 self._activate_kill_switch(f"Daily loss limit ({max_loss_pct}%) breached")
-                return RiskCheckResult(
-                    passed=False,
-                    reason=f"Daily loss limit breached: {current_loss_pct:.2f}% >= {max_loss_pct}%"
-                )
+            return RiskCheckResult(
+                passed=False,
+                reason=f"Daily loss limit breached: {current_loss_pct:.2f}% >= {max_loss_pct}%"
+            )
         
         return RiskCheckResult(passed=True, reason="Daily loss limit not breached")
     
@@ -326,15 +356,11 @@ class RiskManager:
                 )
             
             # Check for existing position in same symbol
-            portfolio_tracker = get_portfolio_tracker()
-            portfolio = portfolio_tracker.get_portfolio_state()
-            
-            for position in portfolio.positions:
-                if position.symbol == symbol and position.side != PositionSide.FLAT:
-                    return RiskCheckResult(
-                        passed=False,
-                        reason=f"Existing position already exists in {symbol}"
-                    )
+            if get_portfolio_tracker().has_position(symbol):
+                return RiskCheckResult(
+                    passed=False,
+                    reason=f"Existing position already exists in {symbol}"
+                )
         
         return RiskCheckResult(passed=True, reason="Position limits not exceeded")
     
@@ -342,12 +368,8 @@ class RiskManager:
                               quantity: int, entry_price: float) -> RiskCheckResult:
         """Check exposure limits."""
         with self._state_lock:
-            max_exposure_pct = self.config.max_exposure_pct / 100.0  # Convert to decimal
-            
-            # Calculate current exposure
-            portfolio_tracker = get_portfolio_tracker()
-            portfolio = portfolio_tracker.get_portfolio_state()
-            equity = portfolio.equity
+            max_exposure_pct = self.config.max_exposure_pct
+            equity = get_portfolio_tracker().get_current_equity()
             
             # Calculate proposed exposure
             proposed_exposure = quantity * entry_price
@@ -410,11 +432,11 @@ class RiskManager:
         market_open = self.config.time_stop_time.replace(hour=9, minute=15)  # 9:15 AM
         market_close = self.config.time_stop_time  # 15:15 or configurable
         
+        if not self.enforce_market_hours:
+            return RiskCheckResult(passed=True, reason="Market hours not enforced")
+        
         try:
-            import pytz
-            tz = pytz.timezone(timezone)
-            now = datetime.now(tz)
-            current_time = now.time()
+            current_time = self._now().time()
             
             # Check if within trading hours
             if current_time < market_open or current_time >= market_close:
@@ -446,20 +468,14 @@ class RiskManager:
     
     def _check_consecutive_failures(self) -> RiskCheckResult:
         """Check for consecutive order failures."""
+        max_failures = self.config.max_consecutive_failures
         with self._state_lock:
-            max_failures = self.system_config.get('risk_management', {}).get(
-                'circuit_breakers', {}).get('consecutive_failures_limit', 3
-            )
-            
-            if self._state.consecutive_failures >= max_failures:
-                # Activate kill switch
-                self._activate_kill_switch(
-                    f"Consecutive order failures: {self._state.consecutive_failures} >= {max_failures}"
-                )
-                return RiskCheckResult(
-                    passed=False,
-                    reason=f"Consecutive failures limit reached: {self._state.consecutive_failures}"
-                )
+            failures = self._state.consecutive_failures
+        
+        if failures >= max_failures:
+            self._activate_kill_switch(f"Consecutive order failures: {failures} >= {max_failures}")
+            return RiskCheckResult(passed=False,
+                                   reason=f"Consecutive failures limit reached: {failures}")
         
         return RiskCheckResult(passed=True, reason="Consecutive failures within limit")
     
@@ -513,13 +529,20 @@ class RiskManager:
         """Emergency square off all positions."""
         self.logger.critical("EMERGENCY SQUARE OFF: Closing all positions")
         
-        # Get all open positions
-        portfolio_tracker = get_portfolio_tracker()
-        portfolio = portfolio_tracker.get_portfolio_state()
+        # Preferred path: the execution engine owns positions and their orders
+        try:
+            from intraday_system import execution_engine as ee
+            if ee._execution_engine is not None:
+                ee._execution_engine.square_off_all_positions("KILL SWITCH")
+                return
+        except Exception as e:
+            self.logger.error(f"Execution engine square-off failed, falling back: {e}")
         
-        # Place market orders to close all positions
+        # Fallback: flatten every position the ledger knows about directly
+        portfolio = get_portfolio_tracker().get_portfolio_state()
         from intraday_system.order_manager import get_order_manager
         order_manager = get_order_manager()
+        order_manager.cancel_all_orders()
         
         for position in portfolio.positions:
             if position.side != PositionSide.FLAT:
@@ -536,9 +559,6 @@ class RiskManager:
                     reason="KILL SWITCH ACTIVATED - EMERGENCY SQUARE OFF",
                     priority=True
                 )
-        
-        # Cancel all pending orders
-        order_manager.cancel_all_orders()
     
     def _check_kill_file(self) -> bool:
         """Check if kill file exists."""
@@ -581,8 +601,7 @@ class RiskManager:
             for _ in range(int(self._kill_file_check_interval * 10)):
                 if not self._kill_file_running:
                     break
-                import time
-                time.sleep(0.1)
+                time_module.sleep(0.1)
     
     def _notify_kill_switch(self, reason: str) -> None:
         """Notify subscribers of kill switch activation."""
@@ -625,33 +644,14 @@ class RiskManager:
     def on_trade_closed(self, trade: Trade, exit_price: float) -> None:
         """Update risk state when a trade is closed."""
         with self._state_lock:
-            # Calculate PnL
-            pnl = self._calculate_trade_pnl(trade, exit_price)
-            
-            # Update daily PnL
-            self._state.daily_pnl += pnl
-            
-            # Update portfolio
-            portfolio_tracker = get_portfolio_tracker()
-            portfolio = portfolio_tracker.get_portfolio_state()
-            equity = portfolio.equity
-            
-            # Update daily PnL percentage
-            if equity > 0:
-                self._state.daily_pnl_pct = (self._state.daily_pnl / equity) * 100
-            
-            # Update exposure
-            trade_value = trade.entry_price * trade.quantity
-            self._state.current_exposure -= trade_value
-            self._state.current_exposure_pct = (self._state.current_exposure / equity) * 100 if equity > 0 else 0
-            self._state.open_positions_count -= 1
-            
+            self._open_trades.pop(trade.trade_id, None)
+            self._daily_trades.append(trade)
             # Start cooldown for symbol
             self._state.cooldown_symbols[trade.symbol] = datetime.utcnow()
-            
-            # Remove from open trades
-            if trade.trade_id in self._open_trades:
-                del self._open_trades[trade.trade_id]
+        self._refresh_state()
+        
+        # Breaching the daily loss limit trips the kill switch immediately
+        self._check_daily_loss_limit()
     
     def _calculate_trade_pnl(self, trade: Trade, exit_price: float) -> float:
         """Calculate PnL for a trade."""
@@ -666,17 +666,9 @@ class RiskManager:
             # Reset daily counters
             self._state.daily_pnl = 0.0
             self._state.daily_pnl_pct = 0.0
-            self._state.daily_trades = []
             
-            # Update daily start
-            timezone = self.system_config.get('system', {}).get('timezone', 'Asia/Kolkata')
-            try:
-                import pytz
-                tz = pytz.timezone(timezone)
-                now = datetime.now(tz)
-                self._daily_start = now.date()
-            except Exception:
-                self._daily_start = datetime.utcnow().date()
+            self._daily_start = self._now().date()
+            self._daily_trades = []
             
             # Reset consecutive failures
             self._state.consecutive_failures = 0
@@ -807,6 +799,10 @@ class RiskManager:
     
     def get_risk_state(self) -> RiskState:
         """Get current risk state."""
+        try:
+            self._refresh_state()
+        except Exception as e:
+            self.logger.error(f"Could not refresh risk state: {e}")
         with self._state_lock:
             return RiskState(
                 daily_pnl=self._state.daily_pnl,
@@ -840,13 +836,12 @@ class RiskManager:
     
     def subscribe(self, callback: Callable) -> None:
         """Subscribe to risk manager events."""
-        if not hasattr(self, 'subscribers'):
-            self.subscribers = []
-        self.subscribers.append(callback)
+        if callback not in self.subscribers:
+            self.subscribers.append(callback)
     
     def unsubscribe(self, callback: Callable) -> None:
         """Unsubscribe from risk manager events."""
-        if hasattr(self, 'subscribers') and callback in self.subscribers:
+        if callback in self.subscribers:
             self.subscribers.remove(callback)
 
 

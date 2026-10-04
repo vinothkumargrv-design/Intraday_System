@@ -176,6 +176,14 @@ class BaseBroker(ABC):
         """Get the status of an order."""
         pass
     
+    async def get_order(self, order_id: OrderId) -> Optional[Order]:
+        """
+        Broker's current view of an order, including filled quantity and
+        average fill price. Brokers should override this; the default only
+        reports the status.
+        """
+        return None
+    
     @abstractmethod
     async def get_open_orders(self) -> List[Order]:
         """Get all open orders."""

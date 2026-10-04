@@ -29,7 +29,7 @@ import aiohttp
 import numpy as np
 import pandas as pd
 
-from intraday_system.config_loader import get_config_loader
+from intraday_system.config_loader import get_config_loader, parse_timeframe
 from intraday_system.logger import data_feed_logger, get_logger
 from intraday_system.models import (
     OHLCV, OrderId, Symbol, Tick, TimeFrame, Timestamp
@@ -101,9 +101,6 @@ class DataCache:
             self.ticks[symbol].append(tick)
             self.latest_ticks[symbol] = tick
             self.last_update[symbol] = tick.timestamp
-        
-        # Notify subscribers
-        self._notify_subscribers('tick', symbol, tick)
     
     def add_ohlcv(self, ohlcv: OHLCV) -> None:
         """Add OHLCV data to the cache."""
@@ -119,7 +116,7 @@ class DataCache:
             
             # Add OHLCV
             self.ohlcv[symbol][timeframe].append(ohlcv)
-            self.latest_ohlcv[symbol][timeframe] = ohlcv
+            self.latest_ohlcv.setdefault(symbol, {})[timeframe] = ohlcv
     
     def get_current_ohlcv(self, symbol: Symbol, timeframe: TimeFrame) -> Optional[OHLCV]:
         """Get the most recent OHLCV for a symbol and timeframe."""
@@ -193,6 +190,14 @@ class DataFeed:
         # Aggregation settings
         self.aggregation_interval_ms = self.ws_config.get('tick_aggregation_interval_ms', 100)
         self._last_aggregation_time = 0
+        
+        # Bars currently being built from ticks: {(symbol, timeframe): OHLCV}
+        self._building_bars: Dict[Tuple[Symbol, TimeFrame], OHLCV] = {}
+        self._bar_timeframes = [TimeFrame._1M, TimeFrame._5M]
+        self._last_cum_volume: Dict[Symbol, float] = {}
+        
+        # Persisting every tick to SQLite is expensive; off by default
+        self.store_ticks = bool(self.config.get('market_data', {}).get('store_ticks', False))
         
         # Load historical data
         self._load_historical_data()
@@ -271,7 +276,7 @@ class DataFeed:
             # For each symbol and timeframe, load recent data
             for symbol in self.symbols:
                 for timeframe in [TimeFrame._1M, TimeFrame._5M]:
-                    ohlcv_data = self.get_historical_ohlcv(
+                    ohlcv_data = self._get_ohlcv_from_db(
                         symbol, timeframe, limit=1000
                     )
                     for ohlcv in ohlcv_data:
@@ -303,6 +308,9 @@ class DataFeed:
         """Stop the data feed."""
         self._running = False
         
+        if getattr(self, '_zerodha', None) is not None:
+            self._zerodha.stop_ticker()
+        
         # Close WebSocket connection
         if hasattr(self, '_ws_client') and self._ws_client:
             try:
@@ -330,31 +338,9 @@ class DataFeed:
         asyncio.set_event_loop(self._loop)
         
         try:
-            # Start WebSocket connection
-            self._loop.run_until_complete(self._start_websocket())
-            
-            # Main loop
-            while self._running:
-                try:
-                    # Run event loop for a short period
-                    self._loop.run_until_complete(
-                        asyncio.wait_for(
-                            self._process_aggregations(),
-                            timeout=0.1
-                        )
-                    )
-                    
-                    # Check WebSocket health
-                    self._check_websocket_health()
-                    
-                    # Small sleep to prevent CPU overload
-                    time.sleep(0.01)
-                    
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    self.logger.error(f"Error in data feed loop: {e}")
-                    time.sleep(1)
+            self._loop.run_until_complete(self._main_async())
+        except Exception as e:
+            self.logger.error(f"Data feed loop terminated: {e}")
         
         finally:
             # Clean up
@@ -363,6 +349,23 @@ class DataFeed:
                     self._loop.run_until_complete(self._ws_client.close())
                 except Exception as e:
                     self.logger.error(f"Error closing WebSocket in thread: {e}")
+    
+    async def _main_async(self) -> None:
+        """Start the feed, then supervise it until stopped."""
+        await self._start_websocket()
+        while self._running:
+            try:
+                await self._process_aggregations()
+                self._check_websocket_health()
+            except Exception as e:
+                self.logger.error(f"Error in data feed loop: {e}")
+            await asyncio.sleep(0.1)
+        
+        # Let background tasks (mock generator, listeners) finish
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     
     async def _start_websocket(self) -> None:
         """Start WebSocket connection based on broker type."""
@@ -380,46 +383,20 @@ class DataFeed:
             await self._start_mock_websocket()
     
     async def _start_zerodha_websocket(self) -> None:
-        """Start Zerodha Kite Connect WebSocket."""
-        from intraday_system.brokers.zerodha_broker import ZerodhaBroker
+        """Stream live ticks from Zerodha's KiteTicker into handle_tick()."""
+        from intraday_system.brokers.zerodha_broker import ZerodhaMarketData
+        
+        def on_status(connected: bool) -> None:
+            self.ws_connected = connected
+            self.logger.info(f"Zerodha ticker {'connected' if connected else 'disconnected'}")
         
         try:
-            broker_config = self.config.get('broker', {}).get('zerodha', {})
-            access_token = broker_config.get('access_token')
-            api_key = broker_config.get('api_key')
-            
-            if not access_token or not api_key:
-                self.logger.error("Zerodha API key and access token are required")
-                return
-            
-            broker = ZerodhaBroker(self.config)
-            
-            # Get instruments and convert to trading symbols
-            instruments = broker.get_instruments()
-            trading_symbols = [
-                instr['tradingsymbol'] for instr in instruments 
-                if instr['tradingsymbol'] in self.symbols
-            ]
-            
-            if not trading_symbols:
-                self.logger.warning("No valid trading symbols found for Zerodha")
-                return
-            
-            # Connect to WebSocket
-            ws_url = broker_config.get('websocket_url', 'wss://api.kite.trade/stream')
-            
-            self._ws_client = await self._connect_websocket(
-                ws_url, 
-                trading_symbols,
-                broker.get_websocket_auth()
-            )
-            
-            self.ws_connected = True
+            self._zerodha = ZerodhaMarketData.from_config(self.config)
+            self._zerodha.start_ticker(self.symbols, self.handle_tick, on_status)
             self.ws_reconnect_attempts = 0
-            self.logger.info(f"Zerodha WebSocket connected with {len(trading_symbols)} symbols")
-            
+            self.logger.info(f"Zerodha ticker started for {len(self.symbols)} symbols")
         except Exception as e:
-            self.logger.error(f"Failed to start Zerodha WebSocket: {e}")
+            self.logger.error(f"Failed to start Zerodha ticker: {e}")
             self.ws_connected = False
     
     async def _start_alpaca_websocket(self) -> None:
@@ -519,6 +496,7 @@ class DataFeed:
     
     async def _listen_websocket(self, websocket: Any) -> None:
         """Listen to WebSocket messages."""
+        import websockets
         try:
             async for message in websocket:
                 await self._process_websocket_message(message)
@@ -545,7 +523,7 @@ class DataFeed:
                 if msg_type == "tick":
                     await self._process_tick(msg_data)
                 elif msg_type == "order_update":
-                    self._notify_subscribers('order_update', msg_data)
+                    self._notify_subscribers('order_update', msg_data.get('tradingsymbol', ''), msg_data)
                 elif msg_type == "connect":
                     self.logger.info(f"WebSocket connected: {msg_data}")
                     self.ws_connected = True
@@ -614,45 +592,64 @@ class DataFeed:
                     volume=float(tick_data.get('v', 0)) if tick_data.get('v') else None
                 )
             
-            # Add to cache
-            self.cache.add_tick(tick)
-            
-            # Store in database
-            self._store_tick(tick)
-            
-            # Process aggregations
-            await self._process_tick_aggregations(tick)
+            self.handle_tick(tick)
             
         except Exception as e:
             self.logger.error(f"Error processing tick data: {e}")
     
-    async def _process_tick_aggregations(self, tick: Tick) -> None:
-        """Process tick aggregations for different timeframes."""
-        current_time = time.time() * 1000  # Current time in milliseconds
+    def handle_tick(self, tick: Tick) -> None:
+        """
+        Single entry point for every incoming tick (live or mock).
         
-        # Only aggregate at specified intervals
-        if current_time - self._last_aggregation_time < self.aggregation_interval_ms:
-            return
+        Caches and optionally stores the tick, notifies tick subscribers and
+        updates the in-progress bars, emitting each bar once it completes.
+        """
+        self.ws_last_ping = datetime.utcnow()  # Any tick proves the feed is alive
+        self.cache.add_tick(tick)
+        if self.store_ticks:
+            self._store_tick(tick)
+        self._notify_subscribers('tick', tick.symbol, tick)
+        self._update_bars(tick)
+    
+    def _update_bars(self, tick: Tick) -> None:
+        """Incrementally build 1m/5m bars; emit completed bars to subscribers."""
+        # Exchange feeds report cumulative day volume; derive per-tick volume
+        quantity = tick.last_quantity or 0.0
+        if tick.volume is not None:
+            previous = self._last_cum_volume.get(tick.symbol)
+            self._last_cum_volume[tick.symbol] = tick.volume
+            if previous is not None and tick.volume >= previous:
+                quantity = tick.volume - previous
         
-        self._last_aggregation_time = current_time
-        
-        # For each symbol, resample ticks to OHLCV
-        for symbol in self.symbols:
-            ticks = self.cache.get_ticks(symbol, limit=1000)
-            if len(ticks) < 2:
-                continue
+        for timeframe in self._bar_timeframes:
+            minutes = 5 if timeframe == TimeFrame._5M else 1
+            ts = tick.timestamp
+            bucket = ts.replace(minute=ts.minute - ts.minute % minutes, second=0, microsecond=0)
+            key = (tick.symbol, timeframe)
+            bar = self._building_bars.get(key)
             
-            # Resample to 1-minute bars
-            ohlcv_1m = self._resample_ticks_to_ohlcv(ticks, TimeFrame._1M)
-            if ohlcv_1m:
-                self.cache.add_ohlcv(ohlcv_1m)
-                self._store_ohlcv(ohlcv_1m)
+            if bar is not None and bucket > bar.timestamp:
+                self._emit_bar(bar)
+                bar = None
+            elif bar is not None and bucket < bar.timestamp:
+                continue  # Out-of-order tick for an already-closed bar
             
-            # Resample to 5-minute bars
-            ohlcv_5m = self._resample_ticks_to_ohlcv(ticks, TimeFrame._5M)
-            if ohlcv_5m:
-                self.cache.add_ohlcv(ohlcv_5m)
-                self._store_ohlcv(ohlcv_5m)
+            if bar is None:
+                self._building_bars[key] = OHLCV(
+                    symbol=tick.symbol, timestamp=bucket, open=tick.last_price,
+                    high=tick.last_price, low=tick.last_price, close=tick.last_price,
+                    volume=quantity, timeframe=timeframe)
+            else:
+                bar.high = max(bar.high, tick.last_price)
+                bar.low = min(bar.low, tick.last_price)
+                bar.close = tick.last_price
+                bar.volume += quantity
+    
+    def _emit_bar(self, bar: OHLCV) -> None:
+        """Publish a completed bar."""
+        self.cache.add_ohlcv(bar)
+        self._store_ohlcv(bar)
+        self._notify_subscribers('ohlcv', bar.symbol, bar)
     
     def _resample_ticks_to_ohlcv(self, ticks: List[Tick], timeframe: TimeFrame) -> Optional[OHLCV]:
         """Resample ticks to OHLCV for the given timeframe."""
@@ -735,6 +732,8 @@ class DataFeed:
         """Check WebSocket connection health and reconnect if needed."""
         if not self._running:
             return
+        if str(self.config.get('broker', {}).get('active', 'PAPER')).upper() == 'ZERODHA':
+            return  # KiteTicker reconnects itself; quiet periods outside market hours are normal
         
         max_disconnect_time = self.ws_config.get('websocket_disconnect_timeout_seconds', 10)
         current_time = datetime.utcnow()
@@ -767,56 +766,50 @@ class DataFeed:
         threading.Timer(delay, reconnect).start()
     
     async def _generate_mock_data(self) -> None:
-        """Generate mock market data for paper trading."""
+        """Generate mock market data (random walk ticks) for paper trading."""
         import random
+        
+        rng = random.Random()
+        prices: Dict[Symbol, float] = {}
+        cumulative_volume: Dict[Symbol, float] = {}
+        tick_interval = float(self.config.get('market_data', {}).get('mock_tick_interval_seconds', 0.25))
         
         while self._running:
             try:
                 for symbol in self.symbols:
-                    # Get current price or start from a base price
-                    current_tick = self.cache.get_current_tick(symbol)
+                    if symbol not in prices:
+                        current_tick = self.cache.get_current_tick(symbol)
+                        prices[symbol] = current_tick.last_price if current_tick else \
+                            float(100 + sum(map(ord, symbol)) * 7 % 2900)
                     
-                    if current_tick:
-                        current_price = current_tick.last_price
-                        base_volume = current_tick.last_quantity or 100
+                    # Small Gaussian step (~0.03% per tick)
+                    previous = prices[symbol]
+                    new_price = max(0.05, previous * (1 + rng.gauss(0, 0.0003)))
+                    prices[symbol] = new_price
+                    
+                    quantity = float(rng.randint(10, 500))
+                    cumulative_volume[symbol] = cumulative_volume.get(symbol, 0.0) + quantity
+                    
+                    # Tick rule: upticks trade at the ask, downticks at the bid
+                    half_spread = new_price * 0.0002
+                    if new_price >= previous:
+                        bid, ask = new_price - 2 * half_spread, new_price
                     else:
-                        # Initialize with a reasonable price
-                        current_price = random.uniform(100, 1000)
-                        base_volume = 100
+                        bid, ask = new_price, new_price + 2 * half_spread
                     
-                    # Generate random price movement
-                    change_pct = random.uniform(-0.5, 0.5)  # -0.5% to +0.5%
-                    price_change = current_price * (change_pct / 100)
-                    new_price = max(0.05, current_price + price_change)  # Minimum tick size
-                    
-                    # Generate random volume
-                    volume_multiplier = random.uniform(0.5, 2.0)
-                    new_volume = base_volume * volume_multiplier
-                    
-                    # Generate bid/ask spread
-                    spread_pct = random.uniform(0.01, 0.1)
-                    spread = new_price * (spread_pct / 100)
-                    bid_price = new_price - spread/2
-                    ask_price = new_price + spread/2
-                    
-                    # Create mock tick
-                    mock_tick = Tick(
+                    self.handle_tick(Tick(
                         symbol=symbol,
-                        timestamp=datetime.utcnow(),
+                        timestamp=datetime.now(),
                         last_price=round(new_price, 2),
-                        last_quantity=round(new_volume, 0),
-                        bid_price=round(bid_price, 2),
-                        bid_quantity=round(new_volume * 0.3, 0),
-                        ask_price=round(ask_price, 2),
-                        ask_quantity=round(new_volume * 0.3, 0),
-                        volume=round(new_volume, 0)
-                    )
-                    
-                    # Add to cache
-                    self.cache.add_tick(mock_tick)
-                    
-                # Sleep for a short time between mock ticks
-                await asyncio.sleep(0.1)
+                        last_quantity=quantity,
+                        bid_price=round(bid, 2),
+                        bid_quantity=float(rng.randint(100, 2000)),
+                        ask_price=round(ask, 2),
+                        ask_quantity=float(rng.randint(100, 2000)),
+                        volume=cumulative_volume[symbol]
+                    ))
+                
+                await asyncio.sleep(tick_interval)
                 
             except asyncio.CancelledError:
                 break
@@ -1022,57 +1015,17 @@ class DataFeed:
                                        from_date: Optional[Timestamp] = None,
                                        to_date: Optional[Timestamp] = None,
                                        limit: Optional[int] = None) -> List[OHLCV]:
-        """Fetch historical data from Zerodha API."""
-        from intraday_system.brokers.zerodha_broker import ZerodhaBroker
-        
+        """Fetch historical candles from Zerodha."""
+        from intraday_system.brokers.zerodha_broker import ZerodhaMarketData
         try:
-            broker = ZerodhaBroker(self.config)
-            
-            # Convert timeframe to Zerodha format
-            interval_map = {
-                TimeFrame._1M: "minute",
-                TimeFrame._5M: "5minute",
-                TimeFrame._15M: "15minute",
-                TimeFrame._1H: "60minute"
-            }
-            interval = interval_map.get(timeframe, "minute")
-            
-            # Get instrument token
-            instruments = broker.get_instruments()
-            instrument = next((i for i in instruments if i['tradingsymbol'] == symbol), None)
-            if not instrument:
-                self.logger.error(f"Instrument {symbol} not found")
-                return []
-            
-            instrument_token = instrument['instrument_token']
-            
-            # Calculate date range
-            to = to_date or datetime.utcnow()
-            from_dt = from_date or (to - timedelta(days=30))
-            
-            # Fetch data
-            data = broker.get_historical_data(
-                instrument_token, interval, from_dt, to, limit
-            )
-            
-            # Convert to OHLCV
-            ohlcv_list = []
-            for row in data:
-                ohlcv_list.append(OHLCV(
-                    symbol=symbol,
-                    timestamp=datetime.fromisoformat(row[0]),
-                    timeframe=timeframe,
-                    open=row[1],
-                    high=row[2],
-                    low=row[3],
-                    close=row[4],
-                    volume=row[5]
-                ))
-            
-            return ohlcv_list
-            
+            market_data = getattr(self, '_zerodha', None) or ZerodhaMarketData.from_config(self.config)
+            to = to_date or datetime.now()
+            frm = from_date or (to - timedelta(days=5))
+            loop = asyncio.get_running_loop()
+            bars = await loop.run_in_executor(None, market_data.historical, symbol, timeframe, frm, to)
+            return bars[-limit:] if limit else bars
         except Exception as e:
-            self.logger.error(f"Failed to fetch Zerodha historical data: {e}")
+            self.logger.error(f"Failed to fetch Zerodha history for {symbol}: {e}")
             return []
     
     async def _fetch_alpaca_historical(self, symbol: Symbol, timeframe: TimeFrame,
@@ -1302,7 +1255,8 @@ class DataFeed:
         
         # Check data recency
         latest = ohlcv_data[-1]
-        time_since_update = (datetime.utcnow() - latest.timestamp).total_seconds()
+        # Feed timestamps are exchange-local wall-clock time
+        time_since_update = (datetime.now() - latest.timestamp).total_seconds()
         max_allowed_age = 300  # 5 minutes
         age_penalty = min(1.0, time_since_update / max_allowed_age)
         

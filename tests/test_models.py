@@ -3,7 +3,7 @@ Unit tests for models.py - Core data structures and enums.
 """
 
 import pytest
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from decimal import Decimal
 from typing import Optional
 
@@ -477,10 +477,10 @@ class TestPosition:
         )
         
         # Current price higher than entry
-        assert position.pnl(18050.0) == 250.0  # (18050 - 18000) * 50
+        assert position.pnl(18050.0) == 2500.0  # (18050 - 18000) * 50
         
         # Current price lower than entry
-        assert position.pnl(17950.0) == -250.0  # (17950 - 18000) * 50
+        assert position.pnl(17950.0) == -2500.0  # (17950 - 18000) * 50
     
     def test_position_pnl_short(self):
         """Test PnL calculation for short position."""
@@ -493,10 +493,10 @@ class TestPosition:
         )
         
         # Current price lower than entry
-        assert position.pnl(17950.0) == 250.0  # (18000 - 17950) * 50
+        assert position.pnl(17950.0) == 2500.0  # (18000 - 17950) * 50
         
         # Current price higher than entry
-        assert position.pnl(18050.0) == -250.0  # (18000 - 18050) * 50
+        assert position.pnl(18050.0) == -2500.0  # (18000 - 18050) * 50
     
     def test_position_pnl_pct(self):
         """Test PnL percentage calculation."""
@@ -508,9 +508,9 @@ class TestPosition:
             entry_timestamp=datetime.now()
         )
         
-        # PnL of 250 on entry value of 900000 (18000 * 50)
+        # PnL of 2500 on entry value of 900000 (18000 * 50)
         pnl_pct = position.pnl_pct(18050.0)
-        expected_pct = (250 / 900000) * 100  # 0.027777...
+        expected_pct = (2500 / 900000) * 100  # 0.27777...
         assert abs(pnl_pct - expected_pct) < 0.000001
 
 

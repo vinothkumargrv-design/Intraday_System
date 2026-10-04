@@ -1,732 +1,370 @@
 """
-Paper Trading Broker Implementation for the Rapid Fire Intraday Trading System.
+Paper Trading Broker for the Rapid Fire Intraday Trading System.
 
-This module provides a paper trading broker that simulates order execution
-without connecting to a real broker. It's used for testing and validation
-before going live.
+Simulates an exchange-connected broker without risking money:
+
+- MARKET orders fill immediately at the current price plus slippage.
+- LIMIT orders fill once the market trades at or through the limit price.
+- SL / SL-M orders trigger when the market crosses the trigger price and then
+  fill like a market order.
+- Net positions and cash are tracked per symbol.
+
+Prices come from a ``price_provider`` callable (normally the live data feed's
+last traded price) so that paper fills track the same market the strategies
+see. Resting orders are re-evaluated whenever their status is queried, so the
+order manager's polling loop drives fills.
 """
 
-import asyncio
+from __future__ import annotations
+
+import random
 import threading
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-import time
-import uuid
+from dataclasses import dataclass, field, replace
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from intraday_system.brokers.base_broker import (
     BaseBroker, BrokerError, BrokerType, ConnectionStatus, OrderBook
 )
 from intraday_system.models import (
-    BracketOrder, OHLCV, Order, OrderId, OrderResponse, 
-    OrderSide, OrderStatus, OrderType, OrderValidity,
-    Position, Symbol, Tick, Timestamp
+    BracketOrder, OHLCV, Order, OrderId, OrderResponse, OrderSide, OrderStatus,
+    OrderType, Position, PositionSide, Symbol, Tick
 )
+
+OPEN_STATUSES = (OrderStatus.PENDING, OrderStatus.PLACED, OrderStatus.PARTIALLY_FILLED)
 
 
 @dataclass
 class PaperBrokerConfig:
-    """Configuration for Paper Broker."""
+    """Configuration for the paper broker."""
     initial_balance: float = 100000.0
-    simulated_slippage: float = 0.0005  # 0.05%
-    simulated_spread: float = 0.001   # 0.1%
-    simulated_latency: float = 0.1     # 100ms
-    fill_probability: float = 0.95      # 95% chance of fill
-    partial_fill_probability: float = 0.1  # 10% chance of partial fill
-    
-    # For generating simulated market data
-    volatility: float = 0.01
-    drift: float = 0.001
-    
-    debug: bool = False
+    simulated_slippage: float = 0.0005   # 0.05% adverse slippage on market fills
+    fill_probability: float = 1.0        # Probability a marketable limit fills per check
+    seed: Optional[int] = None
+
+
+@dataclass
+class _NetPosition:
+    quantity: float = 0.0                # +long / -short
+    average_price: float = 0.0
+    realized_pnl: float = 0.0
 
 
 class PaperBroker(BaseBroker):
-    """
-    Paper trading broker implementation.
-    
-    Features:
-    - Simulates market orders with configurable slippage
-    - Simulates limit orders with fill probability
-    - Tracks positions and PnL
-    - Supports bracket orders
-    - No real money at risk
-    """
-    
+    """Paper trading broker implementation."""
+
     def __init__(self, broker_type: BrokerType, config: Dict[str, Any]):
-        """Initialize Paper broker."""
         super().__init__(broker_type, config)
-        
-        self.config = PaperBrokerConfig(**config.get('paper', {}))
-        
-        # Account state
-        self._balance: float = self.config.initial_balance
-        self._used_margin: float = 0.0
-        self._total_exposure: float = 0.0
-        
-        # Positions: {symbol: Position}
-        self._positions: Dict[Symbol, Position] = {}
-        
-        # Orders: {order_id: Order}
+        paper_cfg = dict(config.get('paper', {}) or {})
+        known = PaperBrokerConfig.__dataclass_fields__.keys()
+        self.paper_config = PaperBrokerConfig(**{k: v for k, v in paper_cfg.items() if k in known})
+
+        self._rng = random.Random(self.paper_config.seed)
+        self._cash = self.paper_config.initial_balance
         self._orders: Dict[OrderId, Order] = {}
-        
-        # Market data simulation
-        self._symbol_prices: Dict[Symbol, float] = {}  # Current price for each symbol
-        self._symbol_volatility: Dict[Symbol, float] = {}  # Volatility for each symbol
-        
-        # WebSocket simulation
-        self._websocket_enabled: bool = False
-        self._tick_callbacks: List[Callable[[Tick], None]] = []
-        self._stop_simulation: bool = False
-        self._simulation_thread: Optional[threading.Thread] = None
-        
-        # Locks
-        self._lock = threading.Lock()
-        
-        # Initialize with some default symbols
-        self._initialize_default_prices()
-    
-    def _initialize_default_prices(self) -> None:
-        """Initialize default prices for common symbols."""
-        default_symbols = [
-            Symbol("NIFTY"),
-            Symbol("BANKNIFTY"),
-            Symbol("RELIANCE"),
-            Symbol("TCS"),
-            Symbol("INFY"),
-            Symbol("HDFCBANK"),
-            Symbol("ICICIBANK"),
-            Symbol("SBIN"),
-        ]
-        
-        for symbol in default_symbols:
-            # Generate random price between 100 and 2000
-            price = 100 + (hash(symbol.value) % 1900)
-            self._symbol_prices[symbol] = float(price)
-            self._symbol_volatility[symbol] = self.config.volatility * (0.5 + hash(symbol.value) % 100 / 200)
-    
+        self._positions: Dict[Symbol, _NetPosition] = {}
+        self._last_prices: Dict[Symbol, float] = {}
+        self._broker_lock = threading.RLock()
+
+        # Callable returning the latest price for a symbol (set by OrderManager)
+        self.price_provider: Optional[Callable[[Symbol], Optional[float]]] = None
+
     # =========================================================================
-    # CONNECTION MANAGEMENT
+    # PRICES
     # =========================================================================
-    
+
+    def set_price(self, symbol: Symbol, price: float) -> None:
+        """Manually set a price (used when no price provider is attached)."""
+        with self._broker_lock:
+            self._last_prices[symbol] = price
+        self._process_resting_orders(symbol)
+
+    def _price(self, symbol: Symbol) -> Optional[float]:
+        price = None
+        if self.price_provider is not None:
+            try:
+                price = self.price_provider(symbol)
+            except Exception:
+                price = None
+        if price is not None:
+            self._last_prices[symbol] = price
+            return price
+        return self._last_prices.get(symbol)
+
+    def _slipped(self, price: float, side: OrderSide) -> float:
+        slip = self.paper_config.simulated_slippage
+        return price * (1 + slip) if side == OrderSide.BUY else price * (1 - slip)
+
+    # =========================================================================
+    # CONNECTION
+    # =========================================================================
+
     async def connect(self) -> bool:
-        """Establish connection."""
         self.connection_status = ConnectionStatus.CONNECTED
-        
-        # Notify callbacks
         for callback in self._connection_callbacks:
             callback(self.connection_status)
-        
         return True
-    
+
     async def disconnect(self) -> None:
-        """Disconnect."""
-        self._stop_simulation = True
-        
-        if self._simulation_thread:
-            self._simulation_thread.join(timeout=2.0)
-            self._simulation_thread = None
-        
         self.connection_status = ConnectionStatus.DISCONNECTED
-        
-        # Notify callbacks
         for callback in self._connection_callbacks:
             callback(self.connection_status)
-    
+
     async def is_connected(self) -> bool:
-        """Check if connected."""
         return self.connection_status == ConnectionStatus.CONNECTED
-    
+
     # =========================================================================
     # MARKET DATA
     # =========================================================================
-    
+
     async def get_market_data(self, symbols: List[Symbol]) -> Dict[Symbol, Tick]:
-        """Get current market data for multiple symbols."""
         result = {}
-        
         for symbol in symbols:
-            if symbol not in self._symbol_prices:
-                # Initialize new symbol
-                self._symbol_prices[symbol] = 100.0 + (hash(symbol.value) % 1900)
-                self._symbol_volatility[symbol] = self.config.volatility
-            
-            # Generate a tick
-            tick = self._generate_tick(symbol)
-            result[symbol] = tick
-        
+            price = self._price(symbol)
+            if price is not None:
+                result[symbol] = Tick(symbol=symbol, timestamp=datetime.now(),
+                                      last_price=price, last_quantity=0)
         return result
-    
-    def _generate_tick(self, symbol: Symbol) -> Tick:
-        """Generate a simulated tick for a symbol."""
-        base_price = self._symbol_prices[symbol]
-        volatility = self._symbol_volatility.get(symbol, self.config.volatility)
-        
-        # Simulate price movement
-        import random
-        price_change = base_price * volatility * (random.random() - 0.5) * 2
-        new_price = base_price + price_change
-        
-        # Update stored price
-        self._symbol_prices[symbol] = new_price
-        
-        # Calculate spread
-        spread = new_price * self.config.simulated_spread
-        bid_price = new_price - spread / 2
-        ask_price = new_price + spread / 2
-        
-        return Tick(
-            symbol=symbol,
-            timestamp=Timestamp(datetime.utcnow().isoformat()),
-            last_price=new_price,
-            last_quantity=100,
-            volume=10000,
-            bid_price=bid_price,
-            bid_quantity=50,
-            ask_price=ask_price,
-            ask_quantity=50,
-            open_price=base_price * 0.99,
-            high_price=base_price * 1.01,
-            low_price=base_price * 0.99,
-            close_price=base_price,
-            change=new_price - base_price,
-            change_percent=(new_price - base_price) / base_price * 100,
-            average_price=base_price,
-            oi=0,
-            oi_day_high=0,
-            oi_day_low=0,
-            is_index=symbol.value in ["NIFTY", "BANKNIFTY"]
-        )
-    
+
     async def get_ohlcv_data(self, symbol: Symbol, timeframe: str,
-                           from_date: datetime, to_date: datetime) -> List[OHLCV]:
-        """Get historical OHLCV data."""
-        if symbol not in self._symbol_prices:
-            self._symbol_prices[symbol] = 100.0 + (hash(symbol.value) % 1900)
-        
-        ohlcv_list = []
-        current_time = from_date
-        base_price = self._symbol_prices[symbol]
-        
-        while current_time < to_date:
-            # Generate simulated OHLCV bar
-            volatility = self._symbol_volatility.get(symbol, self.config.volatility)
-            
-            open_price = base_price
-            high_price = open_price * (1 + volatility * 2)
-            low_price = open_price * (1 - volatility * 2)
-            close_price = open_price * (1 + volatility * (0.5 - 0.5))  # Random walk
-            volume = 1000 + hash(str(current_time)) % 5000
-            
-            ohlcv_list.append(OHLCV(
-                symbol=symbol,
-                timeframe=timeframe,
-                timestamp=Timestamp(current_time.isoformat()),
-                open_price=open_price,
-                high_price=high_price,
-                low_price=low_price,
-                close_price=close_price,
-                volume=volume,
-                oi=0
-            ))
-            
-            # Update base price for next bar
-            base_price = close_price
-            
-            # Move to next bar
-            if timeframe == "1m":
-                current_time += timedelta(minutes=1)
-            elif timeframe == "5m":
-                current_time += timedelta(minutes=5)
-            elif timeframe == "15m":
-                current_time += timedelta(minutes=15)
-            elif timeframe == "1h":
-                current_time += timedelta(hours=1)
-            else:
-                current_time += timedelta(minutes=1)
-        
-        return ohlcv_list
-    
+                             from_date: datetime, to_date: datetime) -> List[OHLCV]:
+        return []  # Paper broker has no history; the data feed provides it
+
     async def get_order_book(self, symbol: Symbol, depth: int = 5) -> OrderBook:
-        """Get order book for a symbol."""
-        base_price = self._symbol_prices.get(symbol, 100.0)
-        spread = base_price * self.config.simulated_spread
-        
-        bids = []
-        asks = []
-        
-        for i in range(depth):
-            bids.append((base_price - spread * (i + 1) / (depth * 2), 100 * (depth - i)))
-            asks.append((base_price + spread * (i + 1) / (depth * 2), 100 * (depth - i)))
-        
-        return OrderBook(
-            symbol=symbol,
-            bids=bids,
-            asks=asks,
-            timestamp=Timestamp(datetime.utcnow().isoformat())
-        )
-    
+        price = self._price(symbol) or 0.0
+        step = price * 0.0001
+        return OrderBook(symbol=symbol,
+                         bids=[(price - step * (i + 1), 100.0) for i in range(depth)],
+                         asks=[(price + step * (i + 1), 100.0) for i in range(depth)])
+
     # =========================================================================
-    # ORDER MANAGEMENT
+    # ORDERS
     # =========================================================================
-    
+
     async def place_order(self, order: Order) -> OrderResponse:
-        """Place a new order."""
-        if not self.connection_status == ConnectionStatus.CONNECTED:
-            raise BrokerError("Not connected", retryable=True)
-        
-        # Generate order ID
-        order_id = self.generate_order_id()
-        
-        # Get current price for the symbol
-        current_price = self._symbol_prices.get(order.symbol, 100.0)
-        
-        # Simulate order execution
-        status, filled_quantity, executed_price = self._simulate_execution(
-            order, current_price
-        )
-        
-        # Create order response
-        order_response = OrderResponse(
-            order_id=order_id,
-            status=status,
-            filled_quantity=filled_quantity,
-            pending_quantity=order.quantity - filled_quantity,
-            average_price=executed_price,
-            executed_price=executed_price,
-            message=f"Order {status.value}"
-        )
-        
-        # Store the order
-        stored_order = Order(
-            order_id=order_id,
-            symbol=order.symbol,
-            side=order.side,
-            quantity=order.quantity,
-            price=order.price or executed_price,
-            order_type=order.order_type,
-            order_validity=order.order_validity,
-            status=status,
-            filled_quantity=filled_quantity,
-            pending_quantity=order.quantity - filled_quantity,
-            average_price=executed_price,
-            trigger_price=order.trigger_price,
-            tag=order.tag or "paper"
-        )
-        
-        with self._lock:
-            self._orders[order_id] = stored_order
-        
-        # If filled, update positions
-        if filled_quantity > 0:
-            await self._update_position(stored_order, filled_quantity, executed_price)
-        
-        # Simulate latency
-        await asyncio.sleep(self.config.simulated_latency)
-        
-        # Notify callbacks
-        if order_id in self._order_callbacks:
-            self._order_callbacks[order_id](order_response)
-        
-        if filled_quantity > 0 and order_id in self._fill_callbacks:
-            self._fill_callbacks[order_id](order_response)
-        
-        return order_response
-    
-    def _simulate_execution(self, order: Order, current_price: float) -> Tuple[OrderStatus, float, float]:
-        """Simulate order execution."""
-        import random
-        
-        random.seed(time.time() * 1000)
-        
-        # Market orders are always filled (with slippage)
-        if order.order_type == OrderType.MARKET:
-            executed_price = self._calculate_slippage(current_price, order.side)
-            return OrderStatus.FILLED, order.quantity, executed_price
-        
-        # Limit orders may not be filled
-        if order.price:
-            if order.side == OrderSide.BUY and order.price < current_price:
-                # Buy limit below market - may not fill
-                if random.random() < self.config.fill_probability:
-                    executed_price = min(order.price, self._calculate_slippage(current_price, order.side))
-                    fill_qty = order.quantity
-                    
-                    # Partial fill
-                    if random.random() < self.config.partial_fill_probability:
-                        fill_qty = order.quantity * (0.5 + random.random() * 0.5)  # 50-100%
-                    
-                    return OrderStatus.FILLED, fill_qty, executed_price
-                else:
-                    return OrderStatus.OPEN, 0.0, 0.0
-                    
-            elif order.side == OrderSide.SELL and order.price > current_price:
-                # Sell limit above market - may not fill
-                if random.random() < self.config.fill_probability:
-                    executed_price = max(order.price, self._calculate_slippage(current_price, order.side))
-                    fill_qty = order.quantity
-                    
-                    # Partial fill
-                    if random.random() < self.config.partial_fill_probability:
-                        fill_qty = order.quantity * (0.5 + random.random() * 0.5)  # 50-100%
-                    
-                    return OrderStatus.FILLED, fill_qty, executed_price
-                else:
-                    return OrderStatus.OPEN, 0.0, 0.0
-            else:
-                # Limit order at market price or better - always fill
-                executed_price = self._calculate_slippage(current_price, order.side)
-                return OrderStatus.FILLED, order.quantity, executed_price
-        
-        # Default to market execution
-        executed_price = self._calculate_slippage(current_price, order.side)
-        return OrderStatus.FILLED, order.quantity, executed_price
-    
-    def _calculate_slippage(self, price: float, side: OrderSide) -> float:
-        """Calculate execution price with slippage."""
-        import random
-        
-        slippage_percent = self.config.simulated_slippage
-        
-        if side == OrderSide.BUY:
-            # Buying at slightly higher price
-            slippage_factor = 1 + slippage_percent * (0.5 + random.random())
-        else:
-            # Selling at slightly lower price
-            slippage_factor = 1 - slippage_percent * (0.5 + random.random())
-        
-        return price * slippage_factor
-    
-    async def _update_position(self, order: Order, filled_quantity: float, executed_price: float) -> None:
-        """Update position after order execution."""
-        with self._lock:
-            existing_position = self._positions.get(order.symbol)
-            
-            if existing_position:
-                # Update existing position
-                if order.side == OrderSide.BUY:
-                    new_quantity = existing_position.quantity + filled_quantity
-                    new_average_price = (
-                        existing_position.average_price * existing_position.quantity +
-                        executed_price * filled_quantity
-                    ) / new_quantity if new_quantity > 0 else 0
-                else:  # SELL
-                    new_quantity = existing_position.quantity - filled_quantity
-                    # Average price remains the same for sells
-                    new_average_price = existing_position.average_price
-                
-                position = Position(
-                    symbol=order.symbol,
-                    quantity=new_quantity,
-                    average_price=new_average_price,
-                    last_price=executed_price,
-                    value=new_quantity * executed_price,
-                    pnl=(executed_price - new_average_price) * new_quantity,
-                    side=PositionSide.LONG if new_quantity > 0 else PositionSide.SHORT if new_quantity < 0 else PositionSide.FLAT
-                )
-                self._positions[order.symbol] = position
-                
-                # Update account balance
-                if order.side == OrderSide.BUY:
-                    self._balance -= executed_price * filled_quantity
-                    self._used_margin += executed_price * filled_quantity
-                else:  # SELL
-                    self._balance += executed_price * filled_quantity
-                    self._used_margin -= executed_price * filled_quantity
-                    
-            else:
-                # Create new position
-                position = Position(
-                    symbol=order.symbol,
-                    quantity=filled_quantity if order.side == OrderSide.BUY else -filled_quantity,
-                    average_price=executed_price,
-                    last_price=executed_price,
-                    value=abs(filled_quantity) * executed_price,
-                    pnl=0.0,  # No PnL for new position
-                    side=PositionSide.LONG if order.side == OrderSide.BUY else PositionSide.SHORT
-                )
-                self._positions[order.symbol] = position
-                
-                # Update account balance
-                if order.side == OrderSide.BUY:
-                    self._balance -= executed_price * filled_quantity
-                    self._used_margin += executed_price * filled_quantity
-                else:  # SELL
-                    self._balance += executed_price * filled_quantity
-                    self._used_margin -= executed_price * filled_quantity
-    
+        if self.connection_status != ConnectionStatus.CONNECTED:
+            raise BrokerError("Not connected", broker="paper", retryable=True)
+        if order.quantity <= 0:
+            return OrderResponse(success=False, order_id=order.order_id,
+                                 error_code="INVALID_QUANTITY",
+                                 error_message=f"Invalid quantity {order.quantity}")
+        if order.order_type == OrderType.LIMIT and not order.price:
+            return OrderResponse(success=False, order_id=order.order_id,
+                                 error_code="INVALID_PRICE", error_message="LIMIT order needs a price")
+        if order.order_type in (OrderType.SL, OrderType.SL_M) and not order.trigger_price:
+            return OrderResponse(success=False, order_id=order.order_id,
+                                 error_code="INVALID_TRIGGER", error_message="SL order needs a trigger price")
+
+        broker_order_id = self.generate_order_id()
+        stored = replace(order, broker_order_id=broker_order_id, status=OrderStatus.PLACED,
+                         filled_quantity=0.0, average_fill_price=None)
+        with self._broker_lock:
+            self._orders[broker_order_id] = stored
+
+        self._try_fill(stored, on_arrival=True)
+        return OrderResponse(success=True, order_id=order.order_id, broker_order_id=broker_order_id)
+
     async def place_bracket_order(self, bracket_order: BracketOrder) -> Tuple[OrderResponse, OrderResponse, OrderResponse]:
-        """Place a bracket order (entry + SL + TP)."""
-        # Create and place the three orders
-        entry_order_response = await self.place_order(
-            Order(
-                order_id=OrderId(""),  # Will be generated
-                symbol=bracket_order.symbol,
-                side=bracket_order.side,
-                quantity=bracket_order.quantity,
-                price=bracket_order.price,
-                order_type=bracket_order.order_type,
-                order_validity=OrderValidity.INTRADAY,
-                status=OrderStatus.OPEN,
-                tag=bracket_order.tag or "bracket_entry"
-            )
-        )
+        entry = await self.place_order(bracket_order.entry_order)
+        sl = await self.place_order(bracket_order.sl_order)
+        tp = await self.place_order(bracket_order.tp_order) if bracket_order.tp_order else \
+            OrderResponse(success=False, error_message="No TP order")
+        return entry, sl, tp
+
+    def _try_fill(self, order: Order, on_arrival: bool = False) -> None:
+        """
+        Fill an open order if the market allows it.
         
-        # Create SL and TP orders (as limit orders)
-        sl_order_response = await self.place_order(
-            Order(
-                order_id=OrderId(""),
-                symbol=bracket_order.symbol,
-                side=OrderSide.SELL if bracket_order.side == OrderSide.BUY else OrderSide.BUY,
-                quantity=bracket_order.quantity,
-                price=bracket_order.stop_loss,
-                order_type=OrderType.SL,
-                order_validity=OrderValidity.INTRADAY,
-                status=OrderStatus.OPEN,
-                tag=bracket_order.tag or "bracket_sl"
-            )
-        )
-        
-        tp_order_response = await self.place_order(
-            Order(
-                order_id=OrderId(""),
-                symbol=bracket_order.symbol,
-                side=OrderSide.SELL if bracket_order.side == OrderSide.BUY else OrderSide.BUY,
-                quantity=bracket_order.quantity,
-                price=bracket_order.take_profit,
-                order_type=OrderType.LIMIT,
-                order_validity=OrderValidity.INTRADAY,
-                status=OrderStatus.OPEN,
-                tag=bracket_order.tag or "bracket_tp"
-            )
-        )
-        
-        return (entry_order_response, sl_order_response, tp_order_response)
-    
-    async def modify_order(self, order_id: OrderId,
-                          quantity: Optional[float] = None,
-                          price: Optional[float] = None,
-                          stop_loss: Optional[float] = None,
-                          take_profit: Optional[float] = None) -> OrderResponse:
-        """Modify an existing order."""
-        with self._lock:
+        A LIMIT order that is marketable on arrival takes the market price;
+        one that was resting fills at its own limit price when the market
+        trades through it.
+        """
+        if order.status not in OPEN_STATUSES:
+            return
+        price = self._price(order.symbol)
+        if price is None:
+            return
+
+        fill_price: Optional[float] = None
+        buy = order.order_side == OrderSide.BUY
+        if order.order_type == OrderType.MARKET:
+            fill_price = self._slipped(price, order.order_side)
+        elif order.order_type == OrderType.LIMIT:
+            marketable = price <= order.price if buy else price >= order.price
+            if marketable and self._rng.random() <= self.paper_config.fill_probability:
+                if on_arrival:
+                    fill_price = min(price, order.price) if buy else max(price, order.price)
+                else:
+                    fill_price = order.price
+        elif order.order_type in (OrderType.SL, OrderType.SL_M):
+            triggered = price >= order.trigger_price if buy else price <= order.trigger_price
+            if triggered:
+                fill_price = self._slipped(price, order.order_side)
+                if order.order_type == OrderType.SL and order.price:
+                    # Stop-limit: don't fill worse than the limit
+                    if (buy and fill_price > order.price) or (not buy and fill_price < order.price):
+                        return
+        if fill_price is None:
+            return
+
+        with self._broker_lock:
+            quantity = order.quantity - order.filled_quantity
+            order.filled_quantity = order.quantity
+            order.average_fill_price = fill_price
+            order.status = OrderStatus.COMPLETED
+            self._apply_fill(order.symbol, order.order_side, quantity, fill_price)
+
+        for callback in list(self._fill_callbacks.values()):
+            try:
+                callback(OrderResponse(success=True, order_id=order.order_id,
+                                       broker_order_id=order.broker_order_id))
+            except Exception:
+                pass
+
+    def _apply_fill(self, symbol: Symbol, side: OrderSide, quantity: float, price: float) -> None:
+        pos = self._positions.setdefault(symbol, _NetPosition())
+        signed = quantity if side == OrderSide.BUY else -quantity
+        self._cash -= signed * price
+
+        if pos.quantity == 0 or (pos.quantity > 0) == (signed > 0):
+            # Opening or adding
+            total = pos.quantity + signed
+            pos.average_price = (pos.average_price * abs(pos.quantity) + price * quantity) / abs(total)
+            pos.quantity = total
+        else:
+            # Reducing / closing / flipping
+            closing = min(abs(signed), abs(pos.quantity))
+            direction = 1 if pos.quantity > 0 else -1
+            pos.realized_pnl += (price - pos.average_price) * closing * direction
+            pos.quantity += signed
+            if abs(pos.quantity) < 1e-9:
+                pos.quantity, pos.average_price = 0.0, 0.0
+            elif (pos.quantity > 0) != (direction > 0):
+                pos.average_price = price  # Flipped direction
+
+    def _process_resting_orders(self, symbol: Optional[Symbol] = None) -> None:
+        with self._broker_lock:
+            orders = [o for o in self._orders.values()
+                      if o.status in OPEN_STATUSES and (symbol is None or o.symbol == symbol)]
+        for order in orders:
+            self._try_fill(order)
+
+    async def modify_order(self, order_id: OrderId, quantity: Optional[float] = None,
+                           price: Optional[float] = None, trigger_price: Optional[float] = None,
+                           stop_loss: Optional[float] = None,
+                           take_profit: Optional[float] = None) -> OrderResponse:
+        with self._broker_lock:
             order = self._orders.get(order_id)
-            if not order:
-                raise BrokerError(f"Order {order_id} not found")
-            
-            # Update order
+            if order is None or order.status not in OPEN_STATUSES:
+                return OrderResponse(success=False, order_id=order_id,
+                                     error_code="NOT_MODIFIABLE",
+                                     error_message=f"Order {order_id} not open")
             if quantity is not None:
                 order.quantity = quantity
             if price is not None:
                 order.price = price
-            if stop_loss is not None:
-                order.trigger_price = stop_loss
-            
-            return OrderResponse(
-                order_id=order_id,
-                status=order.status,
-                message="Order modified"
-            )
-    
+            if trigger_price is not None or stop_loss is not None:
+                order.trigger_price = trigger_price if trigger_price is not None else stop_loss
+        self._try_fill(order)
+        return OrderResponse(success=True, order_id=order.order_id, broker_order_id=order_id)
+
     async def cancel_order(self, order_id: OrderId) -> bool:
-        """Cancel an order."""
-        with self._lock:
-            if order_id in self._orders:
-                order = self._orders[order_id]
-                if order.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED, OrderStatus.TRIGGERED]:
-                    order.status = OrderStatus.CANCELLED
-                    del self._orders[order_id]
-                    return True
-                else:
-                    return False
-            return False
-    
-    async def cancel_all_orders(self, symbol: Optional[Symbol] = None) -> int:
-        """Cancel all orders."""
-        with self._lock:
-            cancelled_count = 0
-            
-            if symbol:
-                # Cancel orders for specific symbol
-                orders_to_cancel = [
-                    order_id for order_id, order in self._orders.items()
-                    if order.symbol == symbol and 
-                    order.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED, OrderStatus.TRIGGERED]
-                ]
-            else:
-                # Cancel all orders
-                orders_to_cancel = [
-                    order_id for order_id, order in self._orders.items()
-                    if order.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED, OrderStatus.TRIGGERED]
-                ]
-            
-            for order_id in orders_to_cancel:
-                self._orders[order_id].status = OrderStatus.CANCELLED
-                del self._orders[order_id]
-                cancelled_count += 1
-            
-            return cancelled_count
-    
-    async def get_order_status(self, order_id: OrderId) -> OrderStatus:
-        """Get order status."""
-        with self._lock:
+        with self._broker_lock:
             order = self._orders.get(order_id)
-            if order:
-                return order.status
-            return OrderStatus.UNKNOWN
-    
+            if order is None or order.status not in OPEN_STATUSES:
+                return False
+            order.status = OrderStatus.CANCELLED
+            return True
+
+    async def cancel_all_orders(self, symbol: Optional[Symbol] = None) -> int:
+        with self._broker_lock:
+            open_ids = [oid for oid, o in self._orders.items()
+                        if o.status in OPEN_STATUSES and (symbol is None or o.symbol == symbol)]
+        count = 0
+        for oid in open_ids:
+            if await self.cancel_order(oid):
+                count += 1
+        return count
+
+    async def get_order(self, order_id: OrderId) -> Optional[Order]:
+        """Broker's current view of an order (re-evaluates resting orders)."""
+        with self._broker_lock:
+            order = self._orders.get(order_id)
+        if order is None:
+            return None
+        self._try_fill(order)
+        with self._broker_lock:
+            return replace(order)
+
+    async def get_order_status(self, order_id: OrderId) -> OrderStatus:
+        order = await self.get_order(order_id)
+        return order.status if order else OrderStatus.REJECTED
+
     async def get_open_orders(self) -> List[Order]:
-        """Get all open orders."""
-        with self._lock:
-            return [
-                order for order in self._orders.values()
-                if order.status in [OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED, OrderStatus.TRIGGERED]
-            ]
-    
+        with self._broker_lock:
+            return [replace(o) for o in self._orders.values() if o.status in OPEN_STATUSES]
+
+    # =========================================================================
+    # ACCOUNT
+    # =========================================================================
+
     async def get_positions(self) -> List[Position]:
-        """Get current positions."""
-        with self._lock:
-            return list(self._positions.values())
-    
+        with self._broker_lock:
+            items = [(s, p) for s, p in self._positions.items() if p.quantity != 0]
+        return [Position(symbol=s, side=PositionSide.LONG if p.quantity > 0 else PositionSide.SHORT,
+                         quantity=abs(p.quantity), entry_price=p.average_price,
+                         entry_timestamp=datetime.now())
+                for s, p in items]
+
     async def get_position(self, symbol: Symbol) -> Optional[Position]:
-        """Get position for a specific symbol."""
-        with self._lock:
-            return self._positions.get(symbol)
-    
+        for position in await self.get_positions():
+            if position.symbol == symbol:
+                return position
+        return None
+
+    def net_quantity(self, symbol: Symbol) -> float:
+        """Signed net position (+long / -short)."""
+        with self._broker_lock:
+            pos = self._positions.get(symbol)
+            return pos.quantity if pos else 0.0
+
     async def get_account_balance(self) -> Dict[str, Any]:
-        """Get account balance."""
-        with self._lock:
+        with self._broker_lock:
+            market_value = sum(p.quantity * (self._last_prices.get(s) or p.average_price)
+                               for s, p in self._positions.items())
+            realized = sum(p.realized_pnl for p in self._positions.values())
             return {
-                "balance": self._balance,
-                "used_margin": self._used_margin,
-                "available_margin": self._balance - self._used_margin,
-                "total_exposure": self._total_exposure,
-                "currency": "INR"
+                "cash": self._cash,
+                "equity": self._cash + market_value,
+                "realized_pnl": realized,
+                "currency": "INR",
             }
-    
+
     async def get_trade_history(self, symbol: Optional[Symbol] = None,
-                               from_date: Optional[datetime] = None,
-                               to_date: Optional[datetime] = None) -> List[Any]:
-        """Get trade history."""
-        # In paper trading, we don't track trade history
-        return []
-    
+                                from_date: Optional[datetime] = None,
+                                to_date: Optional[datetime] = None) -> List[Any]:
+        with self._broker_lock:
+            return [replace(o) for o in self._orders.values()
+                    if o.status == OrderStatus.COMPLETED and (symbol is None or o.symbol == symbol)]
+
     async def convert_to_market_order(self, order_id: OrderId) -> OrderResponse:
-        """Convert a limit order to market order."""
-        with self._lock:
-            if order_id in self._orders:
-                order = self._orders[order_id]
-                if order.order_type == OrderType.LIMIT:
-                    order.order_type = OrderType.MARKET
-                    # Recalculate execution
-                    current_price = self._symbol_prices.get(order.symbol, 100.0)
-                    executed_price = self._calculate_slippage(current_price, order.side)
-                    order.filled_quantity = order.quantity
-                    order.status = OrderStatus.FILLED
-                    order.average_price = executed_price
-                    
-                    # Update position
-                    await self._update_position(order, order.quantity, executed_price)
-                    
-                    return OrderResponse(
-                        order_id=order_id,
-                        status=OrderStatus.FILLED,
-                        message="Order converted to market and executed"
-                    )
-        
-        raise BrokerError(f"Order {order_id} not found or cannot be converted")
-    
+        with self._broker_lock:
+            order = self._orders.get(order_id)
+            if order is None or order.status not in OPEN_STATUSES:
+                raise BrokerError(f"Order {order_id} not open", broker="paper")
+            order.order_type = OrderType.MARKET
+        self._try_fill(order)
+        return OrderResponse(success=True, order_id=order.order_id, broker_order_id=order_id)
+
     # =========================================================================
-    # SUBSCRIPTION MANAGEMENT
+    # FEATURES
     # =========================================================================
-    
-    def subscribe(self, symbol: Symbol) -> None:
-        """Subscribe to live data for a symbol."""
-        # Initialize price if not exists
-        if symbol not in self._symbol_prices:
-            self._symbol_prices[symbol] = 100.0 + (hash(symbol.value) % 1900)
-            self._symbol_volatility[symbol] = self.config.volatility
-    
-    def unsubscribe(self, symbol: Symbol) -> None:
-        """Unsubscribe from live data for a symbol."""
-        # In paper trading, we don't need to do anything
-        pass
-    
-    def register_tick_callback(self, callback: Callable[[Tick], None]) -> None:
-        """Register callback for tick data."""
-        with self._lock:
-            if callback not in self._tick_callbacks:
-                self._tick_callbacks.append(callback)
-    
-    def unregister_tick_callback(self, callback: Callable[[Tick], None]) -> None:
-        """Unregister tick callback."""
-        with self._lock:
-            if callback in self._tick_callbacks:
-                self._tick_callbacks.remove(callback)
-    
-    # =========================================================================
-    # WEBSOCKET SIMULATION
-    # =========================================================================
-    
-    async def start_simulation(self) -> None:
-        """Start simulated WebSocket data generation."""
-        self._stop_simulation = False
-        self._simulation_thread = threading.Thread(
-            target=self._simulation_loop,
-            daemon=True
-        )
-        self._simulation_thread.start()
-    
-    def _simulation_loop(self) -> None:
-        """Generate simulated market data in a loop."""
-        import time
-        
-        while not self._stop_simulation:
-            try:
-                # Generate ticks for all subscribed symbols
-                with self._lock:
-                    symbols = list(self._symbol_prices.keys())
-                
-                for symbol in symbols:
-                    tick = self._generate_tick(symbol)
-                    
-                    # Notify callbacks
-                    for callback in self._tick_callbacks:
-                        try:
-                            callback(tick)
-                        except:
-                            pass
-                
-                # Sleep for a bit
-                time.sleep(0.1)
-                
-            except Exception:
-                time.sleep(1.0)
-    
-    # =========================================================================
-    # OVERIDDEN PROPERTIES
-    # =========================================================================
-    
+
     def supports_bracket_orders(self) -> bool:
-        """Check if broker supports bracket orders."""
         return True
-    
+
     def supports_oco_orders(self) -> bool:
-        """Check if broker supports OCO orders."""
-        return True
-    
+        return False
+
     def get_max_orders_per_second(self) -> int:
-        """Get maximum orders per second."""
-        return 100  # Paper trading has no rate limits
-    
-    def get_min_order_quantity(self, symbol: Symbol) -> float:
-        """Get minimum order quantity."""
-        return 1.0
-    
-    def get_lot_size(self, symbol: Symbol) -> float:
-        """Get lot size for a symbol."""
-        return 1.0
-    
-    def get_tick_size(self, symbol: Symbol) -> float:
-        """Get tick size for a symbol."""
-        return 0.05
+        return 100

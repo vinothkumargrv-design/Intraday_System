@@ -36,6 +36,112 @@ from intraday_system.risk_manager import get_risk_manager
 
 
 # =============================================================================
+# PURE AGGREGATION LOGIC (shared by live trading and the backtester)
+# =============================================================================
+
+def latest_per_strategy(signals: List[StrategySignal],
+                        now: Optional[Timestamp] = None,
+                        max_age_seconds: Optional[float] = None) -> List[StrategySignal]:
+    """Keep the most recent non-HOLD signal from each strategy, dropping stale ones."""
+    latest: Dict[StrategyName, StrategySignal] = {}
+    for signal in signals:
+        if signal.signal == SignalType.HOLD:
+            continue
+        if now is not None and max_age_seconds is not None:
+            if (now - signal.timestamp).total_seconds() > max_age_seconds:
+                continue
+        current = latest.get(signal.strategy)
+        if current is None or signal.timestamp >= current.timestamp:
+            latest[signal.strategy] = signal
+    return list(latest.values())
+
+
+def score_signals(signals: List[StrategySignal],
+                  weights: Dict[StrategyName, float]) -> Tuple[float, int, int]:
+    """
+    Weighted vote across strategies.
+    
+    Returns (net_score, buy_count, sell_count) where net_score is in [-1, +1]:
+    +1 means all weighted conviction is on the BUY side, -1 all on SELL.
+    """
+    buy_score = 0.0
+    sell_score = 0.0
+    buy_count = 0
+    sell_count = 0
+    
+    for signal in signals:
+        weight = weights.get(signal.strategy, 0.0)
+        if signal.signal == SignalType.BUY:
+            buy_score += weight * signal.confidence
+            buy_count += 1
+        elif signal.signal == SignalType.SELL:
+            sell_score += weight * signal.confidence
+            sell_count += 1
+    
+    total_score = buy_score + sell_score
+    if total_score <= 0:
+        return 0.0, buy_count, sell_count
+    
+    return (buy_score - sell_score) / total_score, buy_count, sell_count
+
+
+def decide(net_score: float, buy_count: int, sell_count: int,
+           threshold: float, min_agreeing: int) -> SignalType:
+    """
+    Turn a weighted vote into a trading decision.
+    
+    Requires |net_score| >= threshold AND at least `min_agreeing` strategies
+    voting in the winning direction.
+    """
+    if net_score >= threshold and buy_count >= min_agreeing:
+        return SignalType.BUY
+    if net_score <= -threshold and sell_count >= min_agreeing:
+        return SignalType.SELL
+    return SignalType.HOLD
+
+
+def atr_percentile(bars: List[OHLCV], period: int = 14) -> Optional[float]:
+    """
+    Percentile rank (0-100) of the latest ATR(period) among the rolling
+    ATR(period) values over ``bars``. None if there is not enough history.
+    """
+    if len(bars) < period * 2:
+        return None
+    true_ranges = [
+        max(cur.high - cur.low, abs(cur.high - prev.close), abs(cur.low - prev.close))
+        for prev, cur in zip(bars, bars[1:])
+    ]
+    atrs = [sum(true_ranges[i - period:i]) / period for i in range(period, len(true_ranges) + 1)]
+    current = atrs[-1]
+    # Mid-rank: ties count half, so constant volatility ranks at the 50th percentile
+    below = sum(1 for a in atrs if a < current)
+    equal = sum(1 for a in atrs if a == current)
+    return 100.0 * (below + 0.5 * equal) / len(atrs)
+
+
+def regime_allows_trading(bars: List[OHLCV], volatility_threshold: float,
+                          period: int = 14) -> bool:
+    """
+    Volatility regime filter: block entries when the current ATR is in the
+    top (1 - threshold) of its recent range, e.g. threshold 0.75 blocks the
+    most volatile 25% of conditions. Allows trading when history is short.
+    """
+    percentile = atr_percentile(bars, period)
+    return percentile is None or percentile <= volatility_threshold * 100
+
+
+def net_confidence(signals: List[StrategySignal], final_signal: SignalType,
+                   net_score: float) -> float:
+    """Confidence of the aggregated decision (0..1)."""
+    agreeing = [s for s in signals if s.signal == final_signal]
+    if not agreeing:
+        return 0.0
+    avg_confidence = sum(s.confidence for s in agreeing) / len(agreeing)
+    agreement_ratio = len(agreeing) / max(len(signals), 1)
+    return min(1.0, avg_confidence * 0.7 + abs(net_score) * 0.2 + agreement_ratio * 0.1)
+
+
+# =============================================================================
 # SIGNAL AGGREGATOR
 # =============================================================================
 
@@ -60,6 +166,16 @@ class SignalAggregator:
         total_weight = sum(self.strategy_weights.values())
         if total_weight > 0:
             self.strategy_weights = {k: v / total_weight for k, v in self.strategy_weights.items()}
+        
+        # Bars of history used by the volatility regime filter
+        self.regime_lookback: int = int(
+            (self.config.get('signal_aggregation', {}).get('regime', {}) or {}).get('lookback_bars', 120)
+        )
+        
+        # Signals older than this are ignored when aggregating
+        self.signal_ttl_seconds: float = float(
+            self.config.get('signal_aggregation', {}).get('signal_ttl_seconds', 300)
+        )
         
         # Signal buffers
         self._signal_buffer: Dict[Symbol, List[StrategySignal]] = defaultdict(list)
@@ -172,24 +288,8 @@ class SignalAggregator:
         
         Returns AggregatedSignal if conditions are met, None otherwise.
         """
-        # Filter out HOLD signals
-        active_signals = [s for s in signals if s.signal != SignalType.HOLD]
-        
-        if not active_signals:
-            return None
-        
-        # Group by strategy
-        signals_by_strategy: Dict[StrategyName, List[StrategySignal]] = defaultdict(list)
-        for signal in active_signals:
-            signals_by_strategy[signal.strategy].append(signal)
-        
-        # Get the most recent signal from each strategy
-        latest_signals: Dict[StrategyName, StrategySignal] = {}
-        for strategy, strategy_signals in signals_by_strategy.items():
-            latest_signals[strategy] = max(strategy_signals, key=lambda x: x.timestamp)
-        
-        # Convert to list
-        unique_signals = list(latest_signals.values())
+        now = max(s.timestamp for s in signals) if signals else datetime.utcnow()
+        unique_signals = latest_per_strategy(signals, now, self.signal_ttl_seconds)
         
         if not unique_signals:
             return None
@@ -197,11 +297,11 @@ class SignalAggregator:
         # Calculate net score
         net_score, buy_count, sell_count = self._calculate_net_score(unique_signals)
         
-        # Calculate net confidence
-        net_confidence = self._calculate_net_confidence(unique_signals, net_score)
-        
         # Determine final signal
         final_signal = self._determine_final_signal(unique_signals, net_score)
+        
+        # Calculate net confidence
+        confidence = net_confidence(unique_signals, final_signal, net_score)
         
         # Check conditions
         if not self._conditions_met(symbol, net_score, buy_count, sell_count, final_signal):
@@ -210,9 +310,9 @@ class SignalAggregator:
         # Create aggregated signal
         aggregated = AggregatedSignal(
             symbol=symbol,
-            timestamp=datetime.utcnow(),
+            timestamp=now,
             net_score=net_score,
-            net_confidence=net_confidence,
+            net_confidence=confidence,
             final_signal=final_signal,
             contributing_strategies=unique_signals,
             regime_filter_passed=True  # Will be updated by _check_market_regime
@@ -226,31 +326,7 @@ class SignalAggregator:
         
         Returns: (net_score, buy_count, sell_count)
         """
-        buy_score = 0.0
-        sell_score = 0.0
-        buy_count = 0
-        sell_count = 0
-        
-        for signal in signals:
-            weight = self.strategy_weights.get(signal.strategy, 0.0)
-            
-            if signal.signal == SignalType.BUY:
-                buy_score += weight * signal.confidence
-                buy_count += 1
-            elif signal.signal == SignalType.SELL:
-                sell_score += weight * signal.confidence
-                sell_count += 1
-        
-        # Normalize scores
-        total_score = buy_score + sell_score
-        if total_score > 0:
-            buy_score /= total_score
-            sell_score /= total_score
-        
-        # Net score: positive for BUY, negative for SELL
-        net_score = buy_score - sell_score
-        
-        return net_score, buy_count, sell_count
+        return score_signals(signals, self.strategy_weights)
     
     def _calculate_net_confidence(self, signals: List[StrategySignal], net_score: float) -> float:
         """
@@ -289,24 +365,18 @@ class SignalAggregator:
         """
         Determine the final signal based on net score and individual signals.
         """
-        if net_score > self.agg_config.threshold:
-            return SignalType.BUY
-        elif net_score < -self.agg_config.threshold:
-            return SignalType.SELL
-        else:
-            return SignalType.HOLD
+        buy_count = sum(1 for s in signals if s.signal == SignalType.BUY)
+        sell_count = sum(1 for s in signals if s.signal == SignalType.SELL)
+        return decide(net_score, buy_count, sell_count,
+                      self.agg_config.threshold, self.agg_config.min_agreeing_strategies)
     
     def _conditions_met(self, symbol: Symbol, net_score: float, 
                         buy_count: int, sell_count: int, final_signal: SignalType) -> bool:
         """Check if all conditions for triggering a trade are met."""
         conditions = [
-            # Net score meets threshold
-            abs(net_score) >= self.agg_config.threshold,
-            
-            # At least 2 strategies agree on direction
-            (buy_count >= 2 and final_signal == SignalType.BUY) or
-            (sell_count >= 2 and final_signal == SignalType.SELL) or
-            (buy_count + sell_count) >= self.agg_config.min_agreeing_strategies,
+            # Net score meets threshold and enough strategies agree on direction
+            decide(net_score, buy_count, sell_count, self.agg_config.threshold,
+                   self.agg_config.min_agreeing_strategies) == final_signal,
             
             # Not HOLD
             final_signal != SignalType.HOLD,
@@ -329,22 +399,16 @@ class SignalAggregator:
             return True
         
         try:
-            # Get ATR percentile
-            atr = self.data_feed.get_atr(symbol, period=14)
-            atr_percentile = self._calculate_atr_percentile(symbol)
-            
-            # Get volatility threshold
-            threshold = self.agg_config.regime_volatility_threshold
-            
-            # If ATR percentile is too high (high volatility), don't trade
-            if atr_percentile > threshold * 100:
-                self.logger.debug(f"High volatility regime for {symbol}: ATR percentile {atr_percentile:.1f}% > {threshold * 100}%")
+            bars = self.data_feed.cache.get_ohlcv(symbol, TimeFrame._1M, limit=self.regime_lookback)
+            if not regime_allows_trading(bars, self.agg_config.regime_volatility_threshold):
+                self.logger.debug(f"High volatility regime for {symbol}: ATR percentile "
+                                  f"{atr_percentile(bars):.0f} > {self.agg_config.regime_volatility_threshold * 100:.0f}")
                 return False
             
-            # Check VIX if configured
-            if self.agg_config.use_regime_filter:
+            regime_cfg = self.config.get('signal_aggregation', {}).get('regime', {}) or {}
+            if regime_cfg.get('use_vix_filter', False):
                 vix = self._get_vix_value()
-                vix_max = self.config.get('signal_aggregation', {}).get('regime', {}).get('vix_max', 25.0)
+                vix_max = regime_cfg.get('vix_max', 25.0)
                 if vix > vix_max:
                     self.logger.debug(f"High VIX regime: {vix:.2f} > {vix_max}")
                     return False
@@ -357,36 +421,10 @@ class SignalAggregator:
             return True
     
     def _calculate_atr_percentile(self, symbol: Symbol) -> float:
-        """Calculate ATR percentile (0-100) for a symbol."""
-        try:
-            # Get historical ATR values
-            atr_periods = [14, 20, 50, 100]
-            atr_values = []
-            
-            for period in atr_periods:
-                atr = self.data_feed.get_atr(symbol, period=period)
-                if atr:
-                    atr_values.append(atr)
-            
-            if not atr_values:
-                return 50.0  # Default to 50th percentile
-            
-            # Current ATR
-            current_atr = self.data_feed.get_atr(symbol, period=14)
-            if current_atr is None:
-                return 50.0
-            
-            # Calculate percentile
-            if current_atr == 0:
-                return 0.0
-            
-            # Use current ATR relative to historical
-            percentile = (current_atr / (sum(atr_values) / len(atr_values))) * 100
-            return min(100.0, max(0.0, percentile))
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating ATR percentile: {e}")
-            return 50.0
+        """ATR percentile (0-100) for a symbol; 50 when history is insufficient."""
+        bars = self.data_feed.cache.get_ohlcv(symbol, TimeFrame._1M, limit=self.regime_lookback)
+        value = atr_percentile(bars)
+        return 50.0 if value is None else value
     
     def _get_vix_value(self) -> float:
         """Get VIX value (mock implementation)."""

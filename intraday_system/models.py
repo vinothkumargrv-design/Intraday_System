@@ -152,7 +152,7 @@ class Tick:
     symbol: Symbol
     timestamp: Timestamp
     last_price: Price
-    last_quantity: Quantity
+    last_quantity: Quantity = 0.0
     bid_price: Optional[Price] = None
     bid_quantity: Optional[Quantity] = None
     ask_price: Optional[Price] = None
@@ -360,7 +360,6 @@ class Position:
     trailing_stop: Optional[Price] = None
     order_id: Optional[OrderId] = None
     
-    @property
     def current_value(self, current_price: Price) -> Price:
         """Calculate current value of the position."""
         if self.side == PositionSide.LONG:
@@ -369,7 +368,6 @@ class Position:
             return self.entry_price * self.quantity - (current_price - self.entry_price) * self.quantity
         return 0.0
     
-    @property
     def pnl(self, current_price: Price) -> Price:
         """Calculate current PnL."""
         if self.side == PositionSide.LONG:
@@ -378,7 +376,6 @@ class Position:
             return (self.entry_price - current_price) * self.quantity
         return 0.0
     
-    @property
     def pnl_pct(self, current_price: Price) -> float:
         """Calculate PnL as percentage of entry value."""
         entry_value = self.entry_price * self.quantity
@@ -499,7 +496,6 @@ class PortfolioState:
         """Count of open positions."""
         return len([p for p in self.positions if p.side != PositionSide.FLAT])
     
-    @property
     def unrealized_pnl(self, price_map: Dict[Symbol, Price]) -> float:
         """Calculate total unrealized PnL."""
         return sum(
@@ -513,12 +509,10 @@ class PortfolioState:
         """Calculate total realized PnL."""
         return sum(t.net_pnl for t in self.closed_trades)
     
-    @property
     def total_pnl(self, price_map: Dict[Symbol, Price]) -> float:
         """Calculate total PnL (realized + unrealized)."""
         return self.realized_pnl + self.unrealized_pnl(price_map)
     
-    @property
     def drawdown(self, peak_equity: float) -> float:
         """Calculate current drawdown from peak equity."""
         if peak_equity == 0:
@@ -543,10 +537,23 @@ class RiskParameters:
     max_spread_pct: float = 0.15  # 0.15%
     slippage_buffer_pct: float = 0.05  # 0.05%
     cooldown_seconds: int = 60
+    max_exposure_pct: float = 500.0  # Gross notional exposure as % of equity
+    max_leverage: float = 5.0
+    min_volume_for_entry: float = 1000.0
+    max_consecutive_failures: int = 3
+    use_trailing_stop: bool = True
+    trailing_activation_r: float = 1.0  # Trail once trade is this many R in profit
+    min_stop_loss_pct: float = 0.5  # Stops closer than this (% of price) are widened
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
+            "max_exposure_pct": self.max_exposure_pct,
+            "max_leverage": self.max_leverage,
+            "min_volume_for_entry": self.min_volume_for_entry,
+            "max_consecutive_failures": self.max_consecutive_failures,
+            "use_trailing_stop": self.use_trailing_stop,
+            "trailing_activation_r": self.trailing_activation_r,
             "max_per_trade_risk_pct": self.max_per_trade_risk_pct,
             "max_concurrent_positions": self.max_concurrent_positions,
             "max_daily_loss_pct": self.max_daily_loss_pct,

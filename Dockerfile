@@ -1,70 +1,39 @@
 # Rapid Fire Intraday Trading System
-# Python 3.11+ based Docker container for production deployment
-
-# Use official Python image
 FROM python:3.11-slim
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=Asia/Kolkata
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    git \
-    libssl-dev \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements file
 COPY requirements.txt .
+RUN pip install -r requirements.txt
 
-# Install Python dependencies
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
-
-# Copy application code
 COPY intraday_system/ ./intraday_system/
-COPY config.yaml .
+COPY config.yaml run_backtest.py ./
 
-# Create necessary directories
-RUN mkdir -p /app/data/historical \
-    /app/data/logs \
-    /app/results \
-    /tmp
+RUN mkdir -p /app/data/historical /app/logs /app/results
 
-# Set volume for persistent data
-VOLUME ["/app/data", "/app/results", "/app/logs"]
+VOLUME ["/app/data", "/app/logs", "/app/results"]
 
-# Expose ports (for dashboard and potential APIs)
-EXPOSE 8501  # Streamlit dashboard
-EXPOSE 8080  # Potential REST API
+# Streamlit dashboard
+EXPOSE 8501
 
-# Environment variables (can be overridden with docker run -e)
-ENV TRADING_MODE="PAPER" \
-    LOG_LEVEL="INFO" \
-    DASHBOARD_ENABLED="true"
+# Healthy while the trading process keeps refreshing its status file (every 5 s)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os, sys, time; p='data/status.json'; sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 60 else 1)"
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import sys; sys.path.append('intraday_system'); from logger import get_logger; logger = get_logger('healthcheck'); logger.info('Health check passed')" || exit 1
-
-# Default command (run paper trading)
+# Default: paper trading. Credentials come from environment variables
+# (ZERODHA_API_KEY, ZERODHA_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, ...), never the image.
 CMD ["python", "-m", "intraday_system.main", "paper"]
 
-# Alternative commands:
-# - Backtest: docker run ... python -m intraday_system.main backtest
-# - Live: docker run ... python -m intraday_system.main live
-# - Dashboard: docker run ... streamlit run intraday_system/dashboard.py
-
-# Build with: docker build -t rapid-fire-trading-system .
-# Run with: docker run -v $(pwd)/data:/app/data rapid-fire-trading-system
-
-# For development with hot reloading:
-# docker run -v $(pwd):/app -v $(pwd)/data:/app/data rapid-fire-trading-system
+# Other entry points:
+#   Backtest:  docker run --rm -v $(pwd)/data:/app/data -v $(pwd)/results:/app/results IMAGE \
+#                python run_backtest.py --synthetic --days 20
+#   Dashboard: docker run --rm -p 8501:8501 -v $(pwd)/data:/app/data -v $(pwd)/results:/app/results IMAGE \
+#                streamlit run intraday_system/dashboard.py --server.address 0.0.0.0
+#   Live:      docker run -e ZERODHA_API_KEY=... -e ZERODHA_ACCESS_TOKEN=... IMAGE \
+#                python -m intraday_system.main live --confirm-live
